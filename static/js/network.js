@@ -11,6 +11,10 @@ let socket = null;
 let selectedNode = null;
 let knownNodes = new Set();  // Track known nodes for drop detection
 let isInitialLoad = true;    // Track if this is the first load (for physics)
+let droppedNodes = new Map(); // Track dropped nodes with timestamp: {nodeId: {timestamp, nodeData}}
+
+// How long to keep dropped nodes visible (15 minutes in milliseconds)
+const DROPPED_NODE_VISIBILITY_MS = 15 * 60 * 1000;
 
 // LocalStorage key for node positions
 const POSITIONS_STORAGE_KEY = 'aredn_node_positions';
@@ -55,6 +59,11 @@ const statusText = document.getElementById('status-text');
 // Event log state
 let eventLog = [];
 
+// Countdown timer state
+let lastScanTime = null;
+let pollInterval = 30;  // Default poll interval in seconds
+let countdownInterval = null;
+
 // Node colors
 const NODE_COLORS = {
     normal: {
@@ -71,6 +80,11 @@ const NODE_COLORS = {
         background: '#9B59B6',
         border: '#8E44AD',
         highlight: { background: '#D7BDE2', border: '#8E44AD' }
+    },
+    dropped: {
+        background: '#CCCCCC',
+        border: '#e74c3c',
+        highlight: { background: '#DDDDDD', border: '#e74c3c' }
     }
 };
 
@@ -420,19 +434,54 @@ function updateNetwork(data) {
     const currentNodeIds = nodesDataset.getIds();
     const newNodeIds = data.nodes.map(n => n.id);
     const savedPositions = loadNodePositions();
+    const now = Date.now();
 
-    // Detect dropped nodes (were known but no longer in the network)
-    const droppedNodes = [];
-    for (const nodeId of knownNodes) {
-        if (!newNodeIds.includes(nodeId)) {
-            droppedNodes.push(nodeId);
+    // Check for nodes that came back online (were dropped but now active)
+    for (const node of data.nodes) {
+        if (droppedNodes.has(node.id)) {
+            console.log(`Node ${node.id} came back online`);
+            droppedNodes.delete(node.id);
         }
     }
 
-    // Show alerts for dropped nodes
-    for (const nodeId of droppedNodes) {
+    // Detect newly dropped nodes (were known but no longer in the network)
+    const newlyDroppedNodes = [];
+    for (const nodeId of knownNodes) {
+        if (!newNodeIds.includes(nodeId) && !droppedNodes.has(nodeId)) {
+            newlyDroppedNodes.push(nodeId);
+        }
+    }
+
+    // Mark newly dropped nodes and keep them visible
+    for (const nodeId of newlyDroppedNodes) {
         showToast('warning', 'Node Dropped', `${nodeId} is no longer responding`);
+
+        // Get existing node data to preserve position
+        const existingNode = nodesDataset.get(nodeId);
+        if (existingNode) {
+            droppedNodes.set(nodeId, {
+                timestamp: now,
+                nodeData: existingNode
+            });
+
+            // Update node appearance to show it's dropped
+            nodesDataset.update({
+                id: nodeId,
+                color: NODE_COLORS.dropped,
+                label: existingNode.label + '\n(offline)',
+                opacity: 0.6
+            });
+        }
         knownNodes.delete(nodeId);
+    }
+
+    // Remove expired dropped nodes (older than 15 minutes)
+    for (const [nodeId, data] of droppedNodes.entries()) {
+        if (now - data.timestamp > DROPPED_NODE_VISIBILITY_MS) {
+            console.log(`Removing expired dropped node: ${nodeId}`);
+            droppedNodes.delete(nodeId);
+            nodesDataset.remove(nodeId);
+        }
     }
 
     // Detect new nodes
@@ -456,8 +505,10 @@ function updateNetwork(data) {
         }
     }
 
-    // Remove nodes that no longer exist
-    const nodesToRemove = currentNodeIds.filter(id => !newNodeIds.includes(id));
+    // Only remove nodes that are not in the dropped list
+    const nodesToRemove = currentNodeIds.filter(id =>
+        !newNodeIds.includes(id) && !droppedNodes.has(id)
+    );
     nodesDataset.remove(nodesToRemove);
 
     // Add or update nodes with appropriate coloring
@@ -518,6 +569,54 @@ function updateStats(nodeCount, linkCount, lastScan, maxDepth) {
         const formattedDate = formatDate(lastScan);
         document.getElementById('footer-last-scan').textContent = formattedDate;
         document.getElementById('last-scan').textContent = formattedDate;
+
+        // Update countdown timer
+        lastScanTime = new Date(lastScan);
+        startCountdown();
+    }
+}
+
+/**
+ * Start or restart the countdown timer
+ */
+function startCountdown() {
+    // Clear existing interval
+    if (countdownInterval) {
+        clearInterval(countdownInterval);
+    }
+
+    // Update immediately
+    updateCountdown();
+
+    // Then update every second
+    countdownInterval = setInterval(updateCountdown, 1000);
+}
+
+/**
+ * Update the countdown display
+ */
+function updateCountdown() {
+    const countdownElement = document.getElementById('footer-countdown');
+
+    if (!lastScanTime) {
+        countdownElement.textContent = '--';
+        return;
+    }
+
+    const now = new Date();
+    const nextScan = new Date(lastScanTime.getTime() + (pollInterval * 1000));
+    const remaining = Math.max(0, Math.floor((nextScan - now) / 1000));
+
+    if (remaining <= 0) {
+        countdownElement.textContent = 'Soon...';
+    } else {
+        const minutes = Math.floor(remaining / 60);
+        const seconds = remaining % 60;
+        if (minutes > 0) {
+            countdownElement.textContent = `${minutes}m ${seconds}s`;
+        } else {
+            countdownElement.textContent = `${seconds}s`;
+        }
     }
 }
 
@@ -559,6 +658,12 @@ function initSocket() {
     socket.on('scan_started', (data) => {
         setStatus(true, 'Scanning...');
         document.getElementById('scan-btn').disabled = true;
+        // Show scanning in countdown
+        document.getElementById('footer-countdown').textContent = 'Scanning...';
+        if (countdownInterval) {
+            clearInterval(countdownInterval);
+            countdownInterval = null;
+        }
     });
 
     socket.on('scan_complete', (data) => {
@@ -634,6 +739,13 @@ async function loadSettings() {
         document.getElementById('starting-node').value = settings.starting_node || '';
         document.getElementById('show-tunnels').checked = settings.show_tunnels === 'true';
         document.getElementById('max-depth').value = settings.max_depth || 5;
+        document.getElementById('auto-scan').checked = settings.auto_scan !== 'false';
+        document.getElementById('poll-interval').value = settings.poll_interval || 30;
+
+        // Update poll interval for countdown
+        if (settings.poll_interval) {
+            pollInterval = settings.poll_interval;
+        }
 
     } catch (error) {
         console.error('Error loading settings:', error);
@@ -647,6 +759,8 @@ async function saveSettings() {
     const startingNode = document.getElementById('starting-node').value.trim();
     const showTunnels = document.getElementById('show-tunnels').checked;
     const maxDepth = parseInt(document.getElementById('max-depth').value) || 5;
+    const autoScan = document.getElementById('auto-scan').checked;
+    const newPollInterval = parseInt(document.getElementById('poll-interval').value) || 30;
 
     try {
         const response = await fetch('/api/settings', {
@@ -655,11 +769,15 @@ async function saveSettings() {
             body: JSON.stringify({
                 starting_node: startingNode,
                 show_tunnels: showTunnels,
-                max_depth: maxDepth
+                max_depth: maxDepth,
+                auto_scan: autoScan,
+                poll_interval: newPollInterval
             })
         });
 
         if (response.ok) {
+            // Update local poll interval
+            pollInterval = newPollInterval;
             alert('Settings saved successfully. A new scan will apply the changes.');
             settingsPanel.classList.add('hidden');
             // Trigger a new scan to apply the changes
@@ -815,6 +933,27 @@ function addEventToLog(event) {
 }
 
 /**
+ * Clear the displayed event log and remove dropped nodes from display
+ * Note: This does NOT clear events from the database
+ */
+function clearDisplayedLog() {
+    // Clear the in-memory event log
+    eventLog = [];
+
+    // Remove all dropped nodes from the network visualization
+    for (const [nodeId, data] of droppedNodes.entries()) {
+        console.log(`Clearing dropped node from display: ${nodeId}`);
+        nodesDataset.remove(nodeId);
+    }
+    droppedNodes.clear();
+
+    // Re-render the empty log
+    renderEventLog();
+
+    showToast('info', 'Log Cleared', 'Displayed events and offline nodes have been cleared');
+}
+
+/**
  * Initialize event listeners
  */
 function initEventListeners() {
@@ -846,6 +985,9 @@ function initEventListeners() {
     document.getElementById('filter-nodes').addEventListener('change', renderEventLog);
     document.getElementById('filter-links').addEventListener('change', renderEventLog);
     document.getElementById('filter-freq').addEventListener('change', renderEventLog);
+
+    // Clear log button
+    document.getElementById('clear-log-btn').addEventListener('click', clearDisplayedLog);
 }
 
 /**
@@ -879,6 +1021,13 @@ function resetNodePositions() {
  */
 async function loadInitialData() {
     try {
+        // Load settings first to get poll interval
+        const settingsResponse = await fetch('/api/settings');
+        const settings = await settingsResponse.json();
+        if (settings.poll_interval) {
+            pollInterval = settings.poll_interval;
+        }
+
         const response = await fetch('/api/network');
         const data = await response.json();
         updateNetwork(data);

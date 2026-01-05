@@ -168,8 +168,13 @@ def api_get_settings():
         settings['show_tunnels'] = 'true' if config.SHOW_TUNNELS else 'false'
     if 'max_depth' not in settings:
         settings['max_depth'] = config.MAX_DEPTH
+    if 'auto_scan' not in settings:
+        settings['auto_scan'] = 'true'
+    if 'poll_interval' not in settings:
+        settings['poll_interval'] = config.POLL_INTERVAL
+    else:
+        settings['poll_interval'] = int(settings['poll_interval'])
 
-    settings['poll_interval'] = config.POLL_INTERVAL
     settings['link_timeout'] = config.LINK_TIMEOUT
     settings['quality_good'] = config.QUALITY_GOOD
     settings['quality_poor'] = config.QUALITY_POOR
@@ -193,6 +198,46 @@ def api_update_settings():
         max_depth = max(1, min(20, int(data['max_depth'])))  # Clamp between 1-20
         database.set_setting('max_depth', str(max_depth))
         logger.info(f"Max depth updated to: {max_depth}")
+
+    if 'auto_scan' in data:
+        auto_scan = 'true' if data['auto_scan'] else 'false'
+        database.set_setting('auto_scan', auto_scan)
+        logger.info(f"Auto scan updated to: {auto_scan}")
+
+        # Update scheduler
+        if data['auto_scan']:
+            if scheduler.get_job('network_scan') is None:
+                poll_interval = int(database.get_setting('poll_interval', config.POLL_INTERVAL))
+                scheduler.add_job(
+                    scheduled_scan,
+                    'interval',
+                    seconds=poll_interval,
+                    id='network_scan',
+                    replace_existing=True
+                )
+                logger.info(f"Scheduler resumed with {poll_interval}s interval")
+        else:
+            job = scheduler.get_job('network_scan')
+            if job:
+                scheduler.remove_job('network_scan')
+                logger.info("Scheduler paused")
+
+    if 'poll_interval' in data:
+        poll_interval = max(10, min(600, int(data['poll_interval'])))  # Clamp between 10-600
+        database.set_setting('poll_interval', str(poll_interval))
+        logger.info(f"Poll interval updated to: {poll_interval}s")
+
+        # Reschedule if auto_scan is enabled
+        auto_scan = database.get_setting('auto_scan', 'true')
+        if auto_scan == 'true':
+            scheduler.add_job(
+                scheduled_scan,
+                'interval',
+                seconds=poll_interval,
+                id='network_scan',
+                replace_existing=True
+            )
+            logger.info(f"Scheduler rescheduled with {poll_interval}s interval")
 
     return jsonify({'success': True, 'settings': database.get_all_settings()})
 

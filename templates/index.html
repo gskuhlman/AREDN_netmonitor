@@ -69,6 +69,17 @@
                         <small class="form-hint">Maximum hops from starting node (1-20)</small>
                     </div>
                     <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="auto-scan" checked>
+                            Enable Automatic Scanning
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label for="poll-interval">Scan Interval (seconds):</label>
+                        <input type="number" id="poll-interval" class="form-input" min="10" max="600" value="30">
+                        <small class="form-hint">Time between automatic scans (10-600 seconds)</small>
+                    </div>
+                    <div class="form-group">
                         <button id="save-settings" class="btn btn-primary">Save Settings</button>
                         <button id="reset-positions" class="btn btn-secondary">Reset Node Positions</button>
                     </div>
@@ -85,7 +96,10 @@
             <aside id="log-panel" class="log-panel hidden">
                 <div class="panel-header">
                     <h2>Event Log</h2>
-                    <button id="close-log" class="btn-close">&times;</button>
+                    <div class="panel-header-buttons">
+                        <button id="clear-log-btn" class="btn btn-secondary btn-small">Clear</button>
+                        <button id="close-log" class="btn-close">&times;</button>
+                    </div>
                 </div>
                 <div class="log-filters">
                     <label class="checkbox-label">
@@ -115,6 +129,7 @@
                 <span>Depth: <strong id="footer-depth">0</strong></span>
             </div>
             <div class="footer-right">
+                <span>Next scan: <span id="footer-countdown">--</span></span>
                 <span>Last scan: <span id="footer-last-scan">Never</span></span>
             </div>
         </footer>
@@ -156,6 +171,9 @@
         </div>
         <div class="legend-item">
             <span class="legend-node supernode"></span> Supernode
+        </div>
+        <div class="legend-item">
+            <span class="legend-node offline"></span> Offline (15 min)
         </div>
         <h4>Services</h4>
         <div class="legend-item">

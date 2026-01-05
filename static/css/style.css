@@ -109,6 +109,17 @@ body {
     color: #333;
 }
 
+.btn-small {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+.panel-header-buttons {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
 /* Main content area */
 .main-content {
     flex: 1;
@@ -434,6 +445,12 @@ body {
 .legend-node.supernode {
     background-color: #9B59B6;
     border: 2px solid #8E44AD;
+}
+
+.legend-node.offline {
+    background-color: #CCCCCC;
+    border: 2px solid #e74c3c;
+    opacity: 0.6;
 }
 
 .service-icon {
