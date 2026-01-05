@@ -1,0 +1,608 @@
+"""
+Database module for AREDN Network Monitor
+SQLite database setup and CRUD operations
+"""
+
+import sqlite3
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+import config
+
+
+def local_timestamp():
+    """Return current local timestamp as string"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_db_path():
+    return config.DATABASE_PATH
+
+
+@contextmanager
+def get_connection():
+    """Context manager for database connections"""
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Initialize database tables"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        # Nodes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                ip TEXT,
+                description TEXT,
+                model TEXT,
+                firmware_version TEXT,
+                lat REAL,
+                lon REAL,
+                rf_frequency TEXT,
+                rf_channel TEXT,
+                first_seen DATETIME,
+                last_seen DATETIME,
+                is_active BOOLEAN DEFAULT 1,
+                is_supernode BOOLEAN DEFAULT 0
+            )
+        ''')
+
+        # Add rf_frequency column if it doesn't exist (migration)
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN rf_frequency TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN rf_channel TEXT')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            cursor.execute('ALTER TABLE nodes ADD COLUMN is_supernode BOOLEAN DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Links table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node TEXT NOT NULL,
+                target_node TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                quality INTEGER DEFAULT 0,
+                snr INTEGER,
+                distance INTEGER,
+                first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                stable_since DATETIME DEFAULT CURRENT_TIMESTAMP,
+                drop_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'good',
+                UNIQUE(source_node, target_node)
+            )
+        ''')
+
+        # Services table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                protocol TEXT,
+                link TEXT,
+                ip TEXT,
+                UNIQUE(node_name, name, ip)
+            )
+        ''')
+
+        # Settings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+
+        # Create indexes for performance
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_node)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_node)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_services_node ON services(node_name)')
+
+
+# ============ Node Operations ============
+
+def upsert_node(name, ip=None, description=None, model=None,
+                firmware_version=None, lat=None, lon=None,
+                rf_frequency=None, rf_channel=None, is_supernode=False):
+    """Insert or update a node"""
+    now = local_timestamp()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO nodes (name, ip, description, model, firmware_version, lat, lon,
+                             rf_frequency, rf_channel, first_seen, last_seen, is_active, is_supernode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                ip = COALESCE(excluded.ip, ip),
+                description = COALESCE(excluded.description, description),
+                model = COALESCE(excluded.model, model),
+                firmware_version = COALESCE(excluded.firmware_version, firmware_version),
+                lat = COALESCE(excluded.lat, lat),
+                lon = COALESCE(excluded.lon, lon),
+                rf_frequency = COALESCE(excluded.rf_frequency, rf_frequency),
+                rf_channel = COALESCE(excluded.rf_channel, rf_channel),
+                last_seen = ?,
+                is_active = 1,
+                is_supernode = excluded.is_supernode
+        ''', (name, ip, description, model, firmware_version, lat, lon,
+              rf_frequency, rf_channel, now, now, is_supernode, now))
+
+
+def get_node(name):
+    """Get a single node by name"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM nodes WHERE name = ?', (name,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_all_nodes():
+    """Get all nodes"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM nodes ORDER BY name')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_active_nodes():
+    """Get all active nodes"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM nodes WHERE is_active = 1 ORDER BY name')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def mark_node_inactive(name):
+    """Mark a node as inactive"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE nodes SET is_active = 0 WHERE name = ?', (name,))
+
+
+def get_nodes_to_mark_inactive(timeout_seconds):
+    """Get nodes that will be marked as inactive (for notifications)"""
+    cutoff_str = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name, ip FROM nodes
+            WHERE last_seen < ?
+            AND is_active = 1
+        ''', (cutoff_str,))
+        return [{'name': row['name'], 'ip': row['ip']} for row in cursor.fetchall()]
+
+
+def mark_stale_nodes_inactive(timeout_seconds):
+    """Mark nodes not seen within timeout as inactive"""
+    cutoff_str = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE nodes
+            SET is_active = 0
+            WHERE last_seen < ?
+            AND is_active = 1
+        ''', (cutoff_str,))
+        return cursor.rowcount
+
+
+# ============ Link Operations ============
+
+def upsert_link(source_node, target_node, link_type, quality=0, snr=None, distance=None):
+    """Insert or update a link"""
+    now = local_timestamp()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        # Check if link exists and was previously dropped
+        cursor.execute('''
+            SELECT status, drop_count FROM links
+            WHERE source_node = ? AND target_node = ?
+        ''', (source_node, target_node))
+        existing = cursor.fetchone()
+
+        if existing and existing['status'] == 'dropped':
+            # Link was dropped, now back - increment drop_count, reset stable_since
+            cursor.execute('''
+                UPDATE links SET
+                    link_type = ?,
+                    quality = ?,
+                    snr = ?,
+                    distance = ?,
+                    last_seen = ?,
+                    stable_since = ?,
+                    drop_count = drop_count + 1,
+                    status = 'good'
+                WHERE source_node = ? AND target_node = ?
+            ''', (link_type, quality, snr, distance, now, now, source_node, target_node))
+        else:
+            # Normal upsert
+            cursor.execute('''
+                INSERT INTO links (source_node, target_node, link_type, quality, snr, distance,
+                                 first_seen, last_seen, stable_since)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_node, target_node) DO UPDATE SET
+                    link_type = excluded.link_type,
+                    quality = excluded.quality,
+                    snr = COALESCE(excluded.snr, snr),
+                    distance = COALESCE(excluded.distance, distance),
+                    last_seen = ?
+            ''', (source_node, target_node, link_type, quality, snr, distance, now, now, now, now))
+
+
+def get_link(source_node, target_node):
+    """Get a specific link"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE source_node = ? AND target_node = ?
+        ''', (source_node, target_node))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_all_links():
+    """Get all links"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM links ORDER BY source_node, target_node')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_active_links():
+    """Get links that are not removed (status != 'removed')"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE status != 'removed'
+            ORDER BY source_node, target_node
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_node_links(node_name):
+    """Get all links for a specific node (as source or target)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE source_node = ? OR target_node = ?
+        ''', (node_name, node_name))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_links_to_drop(timeout_seconds):
+    """Get links that will be marked as dropped (for notifications)"""
+    cutoff_str = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT source_node, target_node, link_type FROM links
+            WHERE last_seen < ?
+            AND status != 'dropped' AND status != 'removed'
+        ''', (cutoff_str,))
+        return [{'source': row['source_node'], 'target': row['target_node'],
+                 'type': row['link_type']} for row in cursor.fetchall()]
+
+
+def mark_stale_links_dropped(timeout_seconds):
+    """Mark links not seen within timeout as dropped"""
+    cutoff_str = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE links
+            SET status = 'dropped'
+            WHERE last_seen < ?
+            AND status != 'dropped' AND status != 'removed'
+        ''', (cutoff_str,))
+        return cursor.rowcount
+
+
+def remove_old_dropped_links(remove_after_seconds):
+    """Remove links that have been dropped for too long"""
+    cutoff_str = (datetime.now() - timedelta(seconds=remove_after_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE links
+            SET status = 'removed'
+            WHERE last_seen < ?
+            AND status = 'dropped'
+        ''', (cutoff_str,))
+        return cursor.rowcount
+
+
+def update_link_status(link_id, status):
+    """Update a link's status"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE links SET status = ? WHERE id = ?', (status, link_id))
+
+
+# ============ Service Operations ============
+
+def upsert_service(node_name, name, protocol=None, link=None, ip=None):
+    """Insert or update a service"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO services (node_name, name, protocol, link, ip)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(node_name, name, ip) DO UPDATE SET
+                protocol = COALESCE(excluded.protocol, protocol),
+                link = COALESCE(excluded.link, link)
+        ''', (node_name, name, protocol, link, ip))
+
+
+def get_node_services(node_name):
+    """Get all services for a node"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM services WHERE node_name = ?', (node_name,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_all_services():
+    """Get all services"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM services ORDER BY node_name, name')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def clear_node_services(node_name):
+    """Remove all services for a node (before re-adding current ones)"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM services WHERE node_name = ?', (node_name,))
+
+
+# ============ Settings Operations ============
+
+def get_setting(key, default=None):
+    """Get a setting value"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+        row = cursor.fetchone()
+        return row['value'] if row else default
+
+
+def set_setting(key, value):
+    """Set a setting value"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ''', (key, value))
+
+
+def get_all_settings():
+    """Get all settings as a dictionary"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT key, value FROM settings')
+        return {row['key']: row['value'] for row in cursor.fetchall()}
+
+
+# ============ Utility Functions ============
+
+def get_link_color(link):
+    """Determine link color based on quality and status"""
+    if link['status'] == 'dropped':
+        return 'red'
+
+    quality = link.get('quality', 0)
+    drop_count = link.get('drop_count', 0)
+
+    if quality > config.QUALITY_GOOD and drop_count == 0:
+        return 'green'
+    elif quality > config.QUALITY_POOR:
+        return 'yellow'
+    else:
+        return 'red'
+
+
+def get_starting_node_firmware():
+    """Get the firmware version of the starting node (first active node)"""
+    # Get the starting node setting
+    starting_url = get_setting('starting_node', config.STARTING_NODE)
+    # Extract hostname from URL
+    host = starting_url.replace('http://', '').replace('https://', '').split('/')[0].split('.')[0].lower()
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Try to find a node that matches the starting hostname
+        cursor.execute('SELECT firmware_version FROM nodes WHERE name LIKE ? AND is_active = 1', (f'%{host}%',))
+        row = cursor.fetchone()
+        if row:
+            return row['firmware_version']
+
+        # Fallback: get the first active node's firmware
+        cursor.execute('SELECT firmware_version FROM nodes WHERE is_active = 1 ORDER BY first_seen LIMIT 1')
+        row = cursor.fetchone()
+        return row['firmware_version'] if row else None
+
+
+def get_service_icon(service_name):
+    """Get icon character for a service based on its name"""
+    name = service_name.lower()
+
+    if 'phone' in name or 'voip' in name or 'sip' in name or 'extension' in name or 'direct ip' in name:
+        return '\u260E'  # Phone
+    if 'meshchat' in name or 'chat' in name:
+        return '\u2709'  # Envelope/message
+    if 'pbx' in name or 'asterisk' in name or 'freepbx' in name:
+        return '\u2706'  # Telephone
+    if 'camera' in name or 'cam' in name or 'video' in name or 'stream' in name:
+        return '\u25CE'  # Camera/bullseye
+    if 'weather' in name or 'weewx' in name:
+        return '\u2600'  # Sun
+    if 'winlink' in name:
+        return '\u2709'  # Envelope
+    if 'web' in name or 'http' in name:
+        return '\u2302'  # House/web
+    return '\u2022'  # Bullet point for unknown
+
+
+def get_network_graph_data():
+    """Get data formatted for vis.js network graph"""
+    nodes = get_active_nodes()
+    links = get_active_links()
+
+    # Get reference firmware version
+    reference_firmware = get_starting_node_firmware()
+
+    # Build node data for vis.js
+    vis_nodes = []
+
+    for node in nodes:
+        firmware = node.get('firmware_version', '')
+        firmware_mismatch = reference_firmware and firmware and firmware != reference_firmware
+        rf_freq = node.get('rf_frequency', '')
+        node_name = node['name']
+        supernode = node.get('is_supernode', False)
+
+        # Get services for this node and build icon string
+        services = get_node_services(node_name)
+        service_icons = ' '.join([get_service_icon(s.get('name', '')) for s in services])
+
+        # Build label with name, frequency, and service icons
+        label_parts = [node_name]
+        if rf_freq:
+            label_parts.append(f"{rf_freq} MHz")
+        if service_icons:
+            label_parts.append(service_icons)
+        label = '\n'.join(label_parts)
+
+        # Build tooltip with service names
+        title_parts = [node_name, node.get('model', 'Unknown model'), f"Firmware: {firmware}"]
+        if supernode:
+            title_parts.append("** SUPERNODE **")
+        if services:
+            title_parts.append("Services: " + ', '.join([s.get('name', '') for s in services]))
+        title = '\n'.join(title_parts)
+
+        vis_nodes.append({
+            'id': node_name,
+            'label': label,
+            'title': title,
+            'model': node.get('model'),
+            'ip': node.get('ip'),
+            'lat': node.get('lat'),
+            'lon': node.get('lon'),
+            'firmware': firmware,
+            'firmware_mismatch': firmware_mismatch,
+            'rf_frequency': rf_freq,
+            'is_supernode': supernode,
+            'node_type': 'main'
+        })
+
+    # Build edge data for vis.js
+    vis_edges = []
+    seen_pairs = set()
+    dtd_pairs = []  # Track DTD-connected node pairs
+
+    # Color map for link quality - RF and tunnel links
+    color_map = {
+        'green': '#27ae60',
+        'yellow': '#f39c12',
+        'red': '#e74c3c'
+    }
+
+    # Color map for DTD links - blue for good, red for bad
+    dtd_color_map = {
+        'green': '#3498db',  # Blue
+        'yellow': '#3498db', # Blue (treat poor as good for DTD)
+        'red': '#e74c3c'     # Red
+    }
+
+    # Color map for Xlink - purple for good, red for bad
+    xlink_color_map = {
+        'green': '#9b59b6',  # Purple
+        'yellow': '#9b59b6', # Purple (treat poor as good for Xlink)
+        'red': '#e74c3c'     # Red
+    }
+
+    for link in links:
+        # Create a canonical pair to avoid duplicates
+        pair = tuple(sorted([link['source_node'], link['target_node']]))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        link_type = link['link_type']
+
+        # QUALITY determines COLOR - DTD uses blue, Xlink uses purple, others use green/yellow/red
+        link_color_status = get_link_color(link)
+        if link_type.upper() == 'DTD':
+            quality_color = dtd_color_map.get(link_color_status, '#3498db')
+        elif link_type.upper() == 'XLINK':
+            quality_color = xlink_color_map.get(link_color_status, '#9b59b6')
+        else:
+            quality_color = color_map.get(link_color_status, '#27ae60')
+
+        # TYPE determines STYLE (line width, dashes, length)
+        # Default: RF link style
+        dashes = False
+        width = 2
+        length = None  # Use physics default
+
+        if link_type.upper() == 'DTD':
+            # DTD: thick solid line, very short length (keeps paired nodes close)
+            width = 5
+            length = 20
+            dtd_pairs.append(pair)
+        elif link_type.upper() in ('WIREGUARD', 'TUN', 'TUNNEL', 'VTUN', 'WG'):
+            # All tunnel types: thin dashed line, longer length
+            dashes = True
+            width = 1
+            length = 300
+
+        # Build edge object
+        edge = {
+            'from': link['source_node'],
+            'to': link['target_node'],
+            'color': {'color': quality_color, 'highlight': quality_color},
+            'width': width,
+            'dashes': dashes,
+            'title': f"Type: {link_type}\nQuality: {link['quality']}%\nSNR: {link.get('snr', 'N/A')}",
+            'link_type': link_type,
+            'quality': link['quality'],
+            'snr': link.get('snr'),
+            'status': link['status'],
+            'drop_count': link.get('drop_count', 0)
+        }
+
+        # Only add length if specified (don't send null)
+        if length is not None:
+            edge['length'] = length
+
+        vis_edges.append(edge)
+
+    return {'nodes': vis_nodes, 'edges': vis_edges}
+
+
+# Initialize database on module load
+init_db()
