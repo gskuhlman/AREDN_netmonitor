@@ -737,7 +737,8 @@ async function loadInitialData() {
         // Also get status
         const statusResponse = await fetch('/api/status');
         const status = await statusResponse.json();
-        updateStats(status.node_count, status.link_count, status.last_scan);
+        const maxDepth = status.last_result ? status.last_result.max_depth_reached : 0;
+        updateStats(status.node_count, status.link_count, status.last_scan, maxDepth);
 
     } catch (error) {
         console.error('Error loading initial data:', error);
