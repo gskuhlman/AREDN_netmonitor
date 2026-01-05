@@ -109,10 +109,23 @@ def init_db():
             )
         ''')
 
+        # Events table for logging
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT NOT NULL,
+                node_name TEXT,
+                details TEXT,
+                severity TEXT DEFAULT 'info'
+            )
+        ''')
+
         # Create indexes for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_node)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_node)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_services_node ON services(node_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC)')
 
 
 # ============ Node Operations ============
@@ -404,6 +417,72 @@ def get_all_settings():
         cursor = conn.cursor()
         cursor.execute('SELECT key, value FROM settings')
         return {row['key']: row['value'] for row in cursor.fetchall()}
+
+
+# ============ Event Operations ============
+
+# Event types
+EVENT_NODE_DISCOVERED = 'node_discovered'
+EVENT_NODE_OFFLINE = 'node_offline'
+EVENT_NODE_ONLINE = 'node_online'
+EVENT_LINK_NEW = 'link_new'
+EVENT_LINK_DROPPED = 'link_dropped'
+EVENT_LINK_RESTORED = 'link_restored'
+EVENT_FREQUENCY_CHANGE = 'frequency_change'
+
+
+def log_event(event_type, node_name=None, details=None, severity='info'):
+    """Log an event to the database"""
+    now = local_timestamp()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO events (timestamp, event_type, node_name, details, severity)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (now, event_type, node_name, details, severity))
+        return cursor.lastrowid
+
+
+def get_events(limit=100, offset=0, event_types=None):
+    """Get recent events, optionally filtered by type"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if event_types:
+            placeholders = ','.join('?' * len(event_types))
+            cursor.execute(f'''
+                SELECT * FROM events
+                WHERE event_type IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+            ''', (*event_types, limit, offset))
+        else:
+            cursor.execute('''
+                SELECT * FROM events
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_events_since(timestamp):
+    """Get events since a given timestamp"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM events
+            WHERE timestamp > ?
+            ORDER BY timestamp ASC
+        ''', (timestamp,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def clear_old_events(days=30):
+    """Remove events older than specified days"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM events WHERE timestamp < ?', (cutoff,))
+        return cursor.rowcount
 
 
 # ============ Utility Functions ============

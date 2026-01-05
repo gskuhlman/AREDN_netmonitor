@@ -73,6 +73,10 @@ def scheduled_scan():
                 'ip': node.get('ip')
             })
 
+        # Emit all events from this scan for real-time log updates
+        for event in result.get('events', []):
+            socketio.emit('new_event', event)
+
         # Get updated network data
         network_data = database.get_network_graph_data()
 
@@ -217,6 +221,23 @@ def api_get_status():
     })
 
 
+@app.route('/api/events')
+def api_get_events():
+    """Get event log"""
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    events = database.get_events(limit=limit, offset=offset)
+    return jsonify(events)
+
+
+@app.route('/api/events/clear', methods=['POST'])
+def api_clear_events():
+    """Clear old events"""
+    days = request.args.get('days', 30, type=int)
+    count = database.clear_old_events(days=days)
+    return jsonify({'success': True, 'cleared': count})
+
+
 # ============ SocketIO Events ============
 
 @socketio.on('connect')
@@ -254,6 +275,16 @@ def handle_request_scan():
 def handle_request_network():
     """Handle request for current network data"""
     emit('network_update', database.get_network_graph_data())
+
+
+@socketio.on('request_events')
+def handle_request_events(data=None):
+    """Handle request for event log"""
+    limit = 100
+    if data and 'limit' in data:
+        limit = data['limit']
+    events = database.get_events(limit=limit)
+    emit('events_update', events)
 
 
 # ============ Startup ============

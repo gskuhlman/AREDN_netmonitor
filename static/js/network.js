@@ -45,10 +45,15 @@ function loadNodePositions() {
 const networkContainer = document.getElementById('network-container');
 const sidePanel = document.getElementById('side-panel');
 const settingsPanel = document.getElementById('settings-panel');
+const logPanel = document.getElementById('log-panel');
 const panelTitle = document.getElementById('panel-title');
 const panelContent = document.getElementById('panel-content');
+const logContent = document.getElementById('log-content');
 const statusIndicator = document.getElementById('status-indicator');
 const statusText = document.getElementById('status-text');
+
+// Event log state
+let eventLog = [];
 
 // Node colors
 const NODE_COLORS = {
@@ -595,6 +600,12 @@ function initSocket() {
         showToast('warning', 'Node Inactive',
             `${data.node} has gone offline`);
     });
+
+    // Handle new events for real-time log updates
+    socket.on('new_event', (data) => {
+        console.log('New event:', data);
+        addEventToLog(data);
+    });
 }
 
 /**
@@ -677,11 +688,141 @@ function toggleSettings() {
 }
 
 /**
+ * Event type icons and labels
+ */
+const EVENT_ICONS = {
+    'node_discovered': { icon: '&#10133;', label: 'Node Discovered', class: 'event-info' },
+    'node_offline': { icon: '&#10060;', label: 'Node Offline', class: 'event-warning' },
+    'node_online': { icon: '&#10004;', label: 'Node Online', class: 'event-success' },
+    'link_new': { icon: '&#128279;', label: 'New Link', class: 'event-info' },
+    'link_dropped': { icon: '&#128280;', label: 'Link Dropped', class: 'event-warning' },
+    'link_restored': { icon: '&#128279;', label: 'Link Restored', class: 'event-success' },
+    'frequency_change': { icon: '&#128246;', label: 'Frequency Change', class: 'event-warning' }
+};
+
+/**
+ * Toggle event log panel
+ */
+function toggleLog() {
+    if (logPanel.classList.contains('hidden')) {
+        loadEventLog();
+        logPanel.classList.remove('hidden');
+        sidePanel.classList.add('hidden');
+        settingsPanel.classList.add('hidden');
+    } else {
+        logPanel.classList.add('hidden');
+    }
+}
+
+/**
+ * Load event log from server
+ */
+async function loadEventLog() {
+    try {
+        const response = await fetch('/api/events?limit=200');
+        const events = await response.json();
+        eventLog = events;
+        renderEventLog();
+    } catch (error) {
+        console.error('Error loading event log:', error);
+    }
+}
+
+/**
+ * Render event log with filters
+ */
+function renderEventLog() {
+    const showNodes = document.getElementById('filter-nodes').checked;
+    const showLinks = document.getElementById('filter-links').checked;
+    const showFreq = document.getElementById('filter-freq').checked;
+
+    const nodeEvents = ['node_discovered', 'node_offline', 'node_online'];
+    const linkEvents = ['link_new', 'link_dropped', 'link_restored'];
+    const freqEvents = ['frequency_change'];
+
+    const filtered = eventLog.filter(event => {
+        if (nodeEvents.includes(event.event_type) && !showNodes) return false;
+        if (linkEvents.includes(event.event_type) && !showLinks) return false;
+        if (freqEvents.includes(event.event_type) && !showFreq) return false;
+        return true;
+    });
+
+    if (filtered.length === 0) {
+        logContent.innerHTML = '<p class="log-empty">No events to display</p>';
+        return;
+    }
+
+    let html = '';
+    for (const event of filtered) {
+        const eventInfo = EVENT_ICONS[event.event_type] || { icon: '&#8226;', label: event.event_type, class: 'event-info' };
+        const timestamp = formatLogTimestamp(event.timestamp);
+
+        html += `
+            <div class="log-entry ${eventInfo.class}">
+                <span class="log-icon">${eventInfo.icon}</span>
+                <div class="log-details">
+                    <div class="log-header">
+                        <span class="log-type">${eventInfo.label}</span>
+                        <span class="log-time">${timestamp}</span>
+                    </div>
+                    <div class="log-node">${event.node_name || ''}</div>
+                    <div class="log-message">${event.details || ''}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    logContent.innerHTML = html;
+}
+
+/**
+ * Format timestamp for log display
+ */
+function formatLogTimestamp(timestamp) {
+    if (!timestamp) return '';
+    const date = new Date(timestamp);
+    return date.toLocaleString();
+}
+
+/**
+ * Add new event to log (called from WebSocket)
+ */
+function addEventToLog(event) {
+    console.log('Adding event to log:', event);
+
+    // Add to beginning of array
+    eventLog.unshift({
+        event_type: event.type,
+        node_name: event.node,
+        details: event.details,
+        severity: event.severity,
+        timestamp: new Date().toISOString()
+    });
+
+    // Keep only last 200 events in memory
+    if (eventLog.length > 200) {
+        eventLog.pop();
+    }
+
+    // Re-render if log panel is visible
+    if (logPanel && !logPanel.classList.contains('hidden')) {
+        renderEventLog();
+        // Scroll to top to show new event
+        if (logContent) {
+            logContent.scrollTop = 0;
+        }
+    }
+}
+
+/**
  * Initialize event listeners
  */
 function initEventListeners() {
     // Scan button
     document.getElementById('scan-btn').addEventListener('click', requestScan);
+
+    // Log button
+    document.getElementById('log-btn').addEventListener('click', toggleLog);
 
     // Settings button
     document.getElementById('settings-btn').addEventListener('click', toggleSettings);
@@ -691,12 +832,20 @@ function initEventListeners() {
     document.getElementById('close-settings').addEventListener('click', () => {
         settingsPanel.classList.add('hidden');
     });
+    document.getElementById('close-log').addEventListener('click', () => {
+        logPanel.classList.add('hidden');
+    });
 
     // Save settings button
     document.getElementById('save-settings').addEventListener('click', saveSettings);
 
     // Reset positions button
     document.getElementById('reset-positions').addEventListener('click', resetNodePositions);
+
+    // Log filter checkboxes
+    document.getElementById('filter-nodes').addEventListener('change', renderEventLog);
+    document.getElementById('filter-links').addEventListener('change', renderEventLog);
+    document.getElementById('filter-freq').addEventListener('change', renderEventLog);
 }
 
 /**

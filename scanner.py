@@ -63,11 +63,13 @@ def is_supernode(data):
 def process_node_data(data):
     """Process and save node data from sysinfo.json response"""
     if not data:
-        return None
+        return None, []
 
     node_name = data.get('node', '').lower()
     if not node_name:
-        return None
+        return None, []
+
+    events = []
 
     # Extract node details
     node_details = data.get('node_details', {})
@@ -98,6 +100,47 @@ def process_node_data(data):
             ip = iface['ip']
             break
 
+    # Check if node exists and track changes
+    existing_node = database.get_node(node_name)
+
+    if existing_node is None:
+        # New node discovered
+        events.append({
+            'type': database.EVENT_NODE_DISCOVERED,
+            'node': node_name,
+            'details': f"Model: {model}, IP: {ip}",
+            'severity': 'info'
+        })
+        logger.info(f"New node discovered: {node_name}")
+    else:
+        # Check if node was previously inactive (came back online)
+        if not existing_node.get('is_active'):
+            events.append({
+                'type': database.EVENT_NODE_ONLINE,
+                'node': node_name,
+                'details': f"Node back online",
+                'severity': 'info'
+            })
+            logger.info(f"Node back online: {node_name}")
+
+        # Check for frequency change (only log if change is >= 1 MHz)
+        old_freq = existing_node.get('rf_frequency', '')
+        if old_freq and rf_frequency and old_freq != rf_frequency:
+            try:
+                old_freq_val = float(old_freq)
+                new_freq_val = float(rf_frequency)
+                freq_diff = abs(new_freq_val - old_freq_val)
+                if freq_diff >= 1.0:  # Only log changes >= 1 MHz
+                    events.append({
+                        'type': database.EVENT_FREQUENCY_CHANGE,
+                        'node': node_name,
+                        'details': f"Frequency changed: {old_freq} MHz -> {rf_frequency} MHz",
+                        'severity': 'warning'
+                    })
+                    logger.info(f"Frequency change on {node_name}: {old_freq} -> {rf_frequency}")
+            except (ValueError, TypeError):
+                pass  # Ignore if frequencies aren't valid numbers
+
     # Upsert the node
     database.upsert_node(
         name=node_name,
@@ -123,17 +166,18 @@ def process_node_data(data):
             ip=ip
         )
 
-    return node_name
+    return node_name, events
 
 
 def process_links(data, source_node):
     """Process LQM tracker data to extract links and discover connected nodes"""
     if not data or not source_node:
-        return []
+        return [], []
 
     lqm_info = data.get('lqm', {}).get('info', {})
     trackers = lqm_info.get('trackers', {})
     discovered_nodes = []
+    events = []
 
     # Handle case where trackers might be a list instead of dict
     if isinstance(trackers, list):
@@ -141,7 +185,7 @@ def process_links(data, source_node):
         trackers = {str(i): t for i, t in enumerate(trackers)}
     elif not isinstance(trackers, dict):
         logger.warning(f"Unexpected trackers type: {type(trackers)}")
-        return []
+        return [], []
 
     # Check if tunnels should be shown (from settings or config)
     show_tunnels = database.get_setting('show_tunnels', 'false').lower() == 'true' or config.SHOW_TUNNELS
@@ -167,6 +211,28 @@ def process_links(data, source_node):
         # Always save RF and DTD links, optionally save tunnel links
         is_tunnel = link_type.upper() in ('WIREGUARD', 'TUN', 'TUNNEL', 'VTUN', 'WG')
         if not is_tunnel or show_tunnels:
+            # Check if this is a new link or restored link
+            existing_link = database.get_link(source_node, hostname)
+
+            if existing_link is None:
+                # New link
+                events.append({
+                    'type': database.EVENT_LINK_NEW,
+                    'node': source_node,
+                    'details': f"New {link_type} link to {hostname} (Q:{quality}%)",
+                    'severity': 'info'
+                })
+                logger.info(f"New link: {source_node} <-> {hostname} ({link_type})")
+            elif existing_link.get('status') == 'dropped':
+                # Link restored
+                events.append({
+                    'type': database.EVENT_LINK_RESTORED,
+                    'node': source_node,
+                    'details': f"{link_type} link to {hostname} restored (Q:{quality}%)",
+                    'severity': 'info'
+                })
+                logger.info(f"Link restored: {source_node} <-> {hostname}")
+
             database.upsert_link(
                 source_node=source_node,
                 target_node=hostname,
@@ -185,7 +251,7 @@ def process_links(data, source_node):
                 'url': build_sysinfo_url(canonical_ip)
             })
 
-    return discovered_nodes
+    return discovered_nodes, events
 
 
 def normalize_start_url(url):
@@ -231,6 +297,7 @@ def discover_network(start_url=None, max_depth=None):
     links_found = 0
     errors = []
     max_depth_reached = 0
+    all_events = []
 
     while queue:
         url, depth = queue.pop(0)
@@ -250,7 +317,9 @@ def discover_network(start_url=None, max_depth=None):
             continue
 
         # Process the node
-        node_name = process_node_data(data)
+        node_name, node_events = process_node_data(data)
+        all_events.extend(node_events)
+
         if not node_name:
             errors.append(f"Invalid node data from: {url}")
             continue
@@ -266,7 +335,8 @@ def discover_network(start_url=None, max_depth=None):
             logger.info(f"Found supernode: {node_name} - not traversing beyond")
 
         # Process links and get discovered nodes
-        discovered = process_links(data, node_name)
+        discovered, link_events = process_links(data, node_name)
+        all_events.extend(link_events)
         links_found += len(discovered)
 
         # Add new nodes to queue only if:
@@ -286,6 +356,7 @@ def discover_network(start_url=None, max_depth=None):
         'nodes_visited': len(visited_nodes),
         'max_depth_reached': max_depth_reached,
         'errors': errors,
+        'events': all_events,
         'timestamp': datetime.now().isoformat()
     }
 
@@ -294,6 +365,16 @@ def update_link_statuses():
     """Update link statuses based on timeouts, return details of changes"""
     # Get links that will be dropped before marking them
     dropped_links = database.get_links_to_drop(config.LINK_TIMEOUT)
+    events = []
+
+    # Log events for dropped links
+    for link in dropped_links:
+        events.append({
+            'type': database.EVENT_LINK_DROPPED,
+            'node': link['source'],
+            'details': f"{link['type']} link to {link['target']} dropped",
+            'severity': 'warning'
+        })
 
     dropped = database.mark_stale_links_dropped(config.LINK_TIMEOUT)
     removed = database.remove_old_dropped_links(config.LINK_REMOVE_AFTER)
@@ -306,7 +387,8 @@ def update_link_statuses():
     return {
         'dropped': dropped,
         'removed': removed,
-        'dropped_links': dropped_links
+        'dropped_links': dropped_links,
+        'events': events
     }
 
 
@@ -314,6 +396,16 @@ def update_node_statuses():
     """Update node statuses based on timeouts, return details of changes"""
     # Get nodes that will be marked inactive before marking them
     inactive_nodes = database.get_nodes_to_mark_inactive(config.LINK_TIMEOUT)
+    events = []
+
+    # Log events for nodes going offline
+    for node in inactive_nodes:
+        events.append({
+            'type': database.EVENT_NODE_OFFLINE,
+            'node': node['name'],
+            'details': f"Node offline (IP: {node.get('ip', 'unknown')})",
+            'severity': 'warning'
+        })
 
     count = database.mark_stale_nodes_inactive(config.LINK_TIMEOUT)
 
@@ -322,7 +414,8 @@ def update_node_statuses():
 
     return {
         'marked_inactive': count,
-        'inactive_nodes': inactive_nodes
+        'inactive_nodes': inactive_nodes,
+        'events': events
     }
 
 
@@ -336,17 +429,33 @@ def run_scan():
     # Discover network
     result = discover_network()
 
+    # Collect all events
+    all_events = result.get('events', [])
+
     # Update link statuses
     link_status = update_link_statuses()
     result['dropped'] = link_status['dropped']
     result['removed'] = link_status['removed']
     result['dropped_links'] = link_status['dropped_links']
+    all_events.extend(link_status.get('events', []))
 
     # Update node statuses
     node_status = update_node_statuses()
     result['inactive_nodes'] = node_status['inactive_nodes']
+    all_events.extend(node_status.get('events', []))
 
-    logger.info(f"Scan complete: {result['nodes_found']} nodes, {result['links_found']} links")
+    # Save all events to database
+    for event in all_events:
+        database.log_event(
+            event_type=event['type'],
+            node_name=event.get('node'),
+            details=event.get('details'),
+            severity=event.get('severity', 'info')
+        )
+
+    result['events'] = all_events
+
+    logger.info(f"Scan complete: {result['nodes_found']} nodes, {result['links_found']} links, {len(all_events)} events")
     return result
 
 
