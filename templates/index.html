@@ -11,6 +11,10 @@
     <!-- Socket.IO for real-time updates -->
     <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
 
+    <!-- Chart.js for RF stats graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+
     <!-- Custom styles -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -18,7 +22,13 @@
     <div class="app-container">
         <!-- Header -->
         <header class="header">
-            <h1>AREDN Network Monitor</h1>
+            <div class="header-left">
+                <h1>AREDN Network Monitor</h1>
+                <nav class="header-tabs">
+                    <button class="tab-btn active" data-tab="network">Network</button>
+                    <button class="tab-btn" data-tab="rf-stats">RF Stats</button>
+                </nav>
+            </div>
             <div class="header-controls">
                 <span id="status-indicator" class="status-indicator"></span>
                 <span id="status-text">Connecting...</span>
@@ -30,8 +40,85 @@
 
         <!-- Main content -->
         <main class="main-content">
-            <!-- Network graph container -->
-            <div id="network-container" class="network-container"></div>
+            <!-- Network View -->
+            <div id="network-view" class="view-container active">
+                <!-- Network graph container -->
+                <div id="network-container" class="network-container"></div>
+            </div>
+
+            <!-- RF Stats View -->
+            <div id="rf-stats-view" class="view-container">
+                <div class="rf-stats-container">
+                    <!-- Charts area -->
+                    <main class="rf-charts-main">
+                        <!-- Header with time range and back button -->
+                        <div class="rf-charts-header">
+                            <div class="rf-header-left">
+                                <button id="rf-back-btn" class="btn btn-secondary hidden">Back to Overview</button>
+                                <div class="time-range-selector">
+                                    <button class="time-btn" data-hours="1">1H</button>
+                                    <button class="time-btn" data-hours="6">6H</button>
+                                    <button class="time-btn" data-hours="12">12H</button>
+                                    <button class="time-btn active" data-hours="24">24H</button>
+                                </div>
+                            </div>
+                            <div class="rf-stats-status">
+                                <span id="rf-stats-link-count">0</span> RF links
+                            </div>
+                        </div>
+
+                        <!-- Selected link info (shown when viewing charts) -->
+                        <div id="selected-link-info" class="selected-link-info hidden">
+                            <h2 id="selected-link-title"></h2>
+                            <div class="selected-link-actions">
+                                <button id="chart-ping-btn" class="btn btn-secondary">Run Ping Test</button>
+                                <button id="chart-iperf-btn" class="btn btn-secondary">Run iPerf Test</button>
+                            </div>
+                        </div>
+
+                        <!-- Charts grid (hidden until link selected) -->
+                        <div id="rf-charts-grid" class="rf-charts-grid hidden">
+                            <div class="chart-card">
+                                <h4>Link Quality (%)</h4>
+                                <canvas id="quality-chart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Signal-to-Noise Ratio (dB)</h4>
+                                <canvas id="snr-chart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Ping Latency (ms)</h4>
+                                <canvas id="ping-chart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Throughput (Mbps)</h4>
+                                <canvas id="throughput-chart"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Overview table -->
+                        <div id="rf-overview-table" class="rf-overview-table">
+                            <h3>All RF Links Overview</h3>
+                            <p class="rf-overview-hint">Click on a link row to view detailed charts</p>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Link</th>
+                                        <th>Quality</th>
+                                        <th>SNR</th>
+                                        <th>Ping (avg)</th>
+                                        <th>Throughput</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="rf-overview-body">
+                                    <!-- Dynamically populated -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </main>
+                </div>
+            </div>
 
             <!-- Side panel for node details -->
             <aside id="side-panel" class="side-panel hidden">
@@ -52,10 +139,10 @@
                 </div>
                 <div class="panel-content">
                     <div class="form-group">
-                        <label for="starting-node">Starting Node URL:</label>
+                        <label for="starting-node">Starting Node:</label>
                         <input type="text" id="starting-node" class="form-input"
-                               placeholder="http://localnode.local.mesh/cgi-bin/sysinfo.json...">
-                        <small class="form-hint">Enter hostname or IP - path will be added automatically</small>
+                               placeholder="localnode.local.mesh or 10.x.x.x">
+                        <small class="form-hint">Just enter hostname or IP address</small>
                     </div>
                     <div class="form-group">
                         <label class="checkbox-label">
@@ -128,6 +215,9 @@
                 <span>Links: <strong id="footer-links">0</strong></span>
                 <span>Depth: <strong id="footer-depth">0</strong></span>
             </div>
+            <div class="footer-center">
+                <span id="footer-scan-status" class="scan-status"></span>
+            </div>
             <div class="footer-right">
                 <span>Next scan: <span id="footer-countdown">--</span></span>
                 <span>Last scan: <span id="footer-last-scan">Never</span></span>
@@ -173,6 +263,9 @@
             <span class="legend-node supernode"></span> Supernode
         </div>
         <div class="legend-item">
+            <span class="legend-node inactive"></span> Inactive (not polled)
+        </div>
+        <div class="legend-item">
             <span class="legend-node offline"></span> Offline (15 min)
         </div>
         <h4>Services</h4>
@@ -185,9 +278,13 @@
         <div class="legend-item">
             <span class="service-icon pbx">&#9742;</span> PBX
         </div>
+        <div class="legend-item">
+            <span class="service-icon iperf">&#128200;</span> iPerf3 (built-in)
+        </div>
     </div>
 
     <!-- Custom JavaScript -->
     <script src="{{ url_for('static', filename='js/network.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/rf-stats.js') }}"></script>
 </body>
 </html>

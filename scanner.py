@@ -410,11 +410,26 @@ def update_node_statuses():
     count = database.mark_stale_nodes_inactive(config.LINK_TIMEOUT)
 
     if count > 0:
-        logger.info(f"Marked {count} nodes as inactive")
+        logger.info(f"Marked {count} nodes as inactive (stale)")
+
+    # Also mark orphan nodes (nodes with no active links) as inactive
+    orphan_nodes = database.get_orphan_nodes()
+    for node in orphan_nodes:
+        events.append({
+            'type': database.EVENT_NODE_OFFLINE,
+            'node': node['name'],
+            'details': f"Node orphaned - no active links (IP: {node.get('ip', 'unknown')})",
+            'severity': 'warning'
+        })
+
+    orphan_count = database.mark_orphan_nodes_inactive()
+
+    if orphan_count > 0:
+        logger.info(f"Marked {orphan_count} orphan nodes as inactive")
 
     return {
-        'marked_inactive': count,
-        'inactive_nodes': inactive_nodes,
+        'marked_inactive': count + orphan_count,
+        'inactive_nodes': inactive_nodes + orphan_nodes,
         'events': events
     }
 

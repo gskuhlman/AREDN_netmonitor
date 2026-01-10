@@ -14,6 +14,7 @@ from datetime import datetime
 import config
 import database
 import scanner
+import rf_stats
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +40,10 @@ scan_state = {
     'last_result': None
 }
 
+# Track active ping sessions per client (sid -> {node_name, session_id})
+active_ping_sessions = {}
+ping_session_counter = 0
+
 
 def scheduled_scan():
     """Background task to scan the network"""
@@ -57,6 +62,10 @@ def scheduled_scan():
         result = scanner.run_scan()
         scan_state['last_scan'] = result['timestamp']
         scan_state['last_result'] = result
+
+        # Record RF link stats (quality/SNR) to history
+        if config.RF_STATS_ENABLED:
+            rf_stats.record_rf_link_stats()
 
         # Emit notifications for dropped links
         for link in result.get('dropped_links', []):
@@ -283,6 +292,119 @@ def api_clear_events():
     return jsonify({'success': True, 'cleared': count})
 
 
+# ============ RF Stats API Routes ============
+
+@app.route('/api/rf-stats/links')
+def api_get_rf_links():
+    """Get all RF links with current stats"""
+    links = database.get_rf_links_with_latest_stats()
+    return jsonify(links)
+
+
+@app.route('/api/rf-stats/history/<source>/<target>')
+def api_get_link_history(source, target):
+    """Get historical data for a specific link"""
+    hours = request.args.get('hours', 24, type=int)
+    history = database.get_link_history(source, target, hours=hours)
+    return jsonify(history)
+
+
+@app.route('/api/rf-stats/history')
+def api_get_all_rf_history():
+    """Get summary history for all RF links"""
+    hours = request.args.get('hours', 24, type=int)
+    history = database.get_all_rf_links_history(hours=hours)
+    return jsonify(history)
+
+
+@app.route('/api/rf-stats/summary')
+def api_get_rf_stats_summary():
+    """Get RF stats collection status"""
+    summary = rf_stats.get_rf_stats_summary()
+    return jsonify(summary)
+
+
+@app.route('/api/ping/<node_name>', methods=['POST'])
+def api_ping_node(node_name):
+    """Simple ping to a node - used by node panel and RF stats"""
+    # Normalize node name to lowercase
+    node_name = node_name.lower()
+
+    # Get node's IP
+    node = database.get_node(node_name)
+    if not node:
+        return jsonify({'error': f'Node "{node_name}" not found'}), 404
+    if not node.get('ip'):
+        return jsonify({'error': f'Node "{node_name}" has no IP address'}), 404
+
+    # Run single ping (count=1 for quick response)
+    result = rf_stats.ping_node(node['ip'], count=1, timeout=2)
+
+    if result:
+        return jsonify({
+            'success': result.get('loss', 100) < 100,
+            'node': node_name,
+            'ip': node['ip'],
+            'time': result.get('avg'),
+            'loss': result.get('loss', 100)
+        })
+
+    return jsonify({'error': 'Ping failed'}), 500
+
+
+@app.route('/api/rf-stats/test/<source>/<target>', methods=['POST'])
+def api_trigger_rf_test(source, target):
+    """Manually trigger a ping or iperf test for a specific link"""
+    test_type = request.args.get('type', 'ping')
+
+    # Normalize node names to lowercase (database stores them in lowercase)
+    source = source.lower()
+    target = target.lower()
+
+    # Try to get target node's IP from database
+    target_node = database.get_node(target)
+    target_ip = target_node.get('ip') if target_node else None
+
+    if test_type == 'ping':
+        result = None
+
+        # If we have the target IP, ping directly
+        if target_ip:
+            result = rf_stats.ping_node(target_ip)
+        else:
+            # Target not in database - use AREDN node's built-in ping
+            # This allows pinging nodes beyond our scan depth
+            result = rf_stats.ping_via_aredn(target)
+
+        if result:
+            database.update_link_history_ping(
+                source, target,
+                result.get('min'), result.get('avg'),
+                result.get('max'), result.get('loss')
+            )
+            return jsonify({'success': True, 'result': result})
+        return jsonify({'error': 'Ping failed - target may not be reachable'}), 500
+
+    elif test_type == 'iperf':
+        # iPerf requires either target IP or hostname
+        if target_ip:
+            result = rf_stats.run_iperf_test(target_ip)
+        else:
+            # Try using target hostname with .local.mesh suffix
+            target_hostname = f"{target}.local.mesh"
+            result = rf_stats.run_iperf_test(target_hostname)
+
+        if result:
+            database.update_link_history_throughput(
+                source, target,
+                result.get('tx_mbps'), result.get('rx_mbps')
+            )
+            return jsonify({'success': True, 'result': result})
+        return jsonify({'error': 'iPerf test failed - target may not be reachable'}), 500
+
+    return jsonify({'error': 'Invalid test type'}), 400
+
+
 # ============ SocketIO Events ============
 
 @socketio.on('connect')
@@ -303,7 +425,15 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection"""
-    logger.info("Client disconnected")
+    from flask import request as flask_request
+
+    sid = flask_request.sid
+
+    # Stop any active ping for this client
+    if sid in active_ping_sessions:
+        del active_ping_sessions[sid]
+
+    logger.info(f"Client {sid} disconnected")
 
 
 @socketio.on('request_scan')
@@ -332,10 +462,113 @@ def handle_request_events(data=None):
     emit('events_update', events)
 
 
+@socketio.on('start_node_ping')
+def handle_start_node_ping(data):
+    """Start continuous ping to a node"""
+    global ping_session_counter
+    from flask import request as flask_request
+
+    node_name = data.get('node')
+    if not node_name:
+        emit('ping_error', {'error': 'No node specified'})
+        return
+
+    # Get node's IP
+    node = database.get_node(node_name.lower())
+    if not node or not node.get('ip'):
+        emit('ping_error', {'error': 'Node IP not found'})
+        return
+
+    ip = node['ip']
+    sid = flask_request.sid
+
+    # Generate unique session ID for this ping
+    ping_session_counter += 1
+    session_id = ping_session_counter
+
+    # Store the new session (this automatically invalidates any previous session)
+    active_ping_sessions[sid] = {'node': node_name, 'session_id': session_id}
+
+    logger.info(f"Starting continuous ping to {node_name} ({ip}) for client {sid}, session {session_id}")
+    emit('ping_started', {'node': node_name, 'ip': ip})
+
+    # Start ping loop using socketio's background task
+    def ping_loop():
+        nonlocal session_id, node_name, ip, sid
+
+        logger.debug(f"Ping loop started for session {session_id}")
+
+        while True:
+            # Check if this session is still active
+            current_session = active_ping_sessions.get(sid)
+            if not current_session or current_session.get('session_id') != session_id:
+                logger.debug(f"Session {session_id} no longer active, exiting loop")
+                break
+
+            result = rf_stats.ping_node(ip, count=1, timeout=2)
+
+            # Check again after ping (it may have taken a few seconds)
+            current_session = active_ping_sessions.get(sid)
+            if not current_session or current_session.get('session_id') != session_id:
+                logger.debug(f"Session {session_id} cancelled during ping, exiting loop")
+                break
+
+            ping_data = {
+                'node': node_name,
+                'ip': ip,
+                'success': result.get('loss', 100) < 100 if result else False,
+                'time': result.get('avg') if result else None,
+                'loss': result.get('loss') if result else 100
+            }
+            socketio.emit('ping_result', ping_data)
+
+            # Wait 1 second between pings
+            socketio.sleep(1)
+
+        logger.info(f"Stopped ping to {node_name} ({ip}), session {session_id}")
+
+    socketio.start_background_task(ping_loop)
+
+
+@socketio.on('stop_node_ping')
+def handle_stop_node_ping(data=None):
+    """Stop continuous ping"""
+    from flask import request as flask_request
+
+    sid = flask_request.sid
+    current_session = active_ping_sessions.get(sid)
+    node_name = current_session.get('node') if current_session else None
+
+    if sid in active_ping_sessions:
+        del active_ping_sessions[sid]
+        logger.info(f"Stopped ping for client {sid}")
+        emit('ping_stopped', {'node': node_name})
+
+
 # ============ Startup ============
+
+def run_ping_round_task():
+    """Background task for ping tests"""
+    if config.RF_STATS_ENABLED:
+        rf_stats.run_ping_round(socketio)
+
+
+def process_iperf_queue_task():
+    """Background task for iperf queue processing"""
+    if config.RF_STATS_ENABLED:
+        # Queue all RF links for testing periodically
+        rf_stats.queue_all_rf_links_for_iperf()
+        rf_stats.process_iperf_queue(socketio)
+
+
+def cleanup_history_task():
+    """Background task for cleaning up old history"""
+    rf_stats.cleanup_old_history()
+
 
 def start_scheduler():
     """Start the background scheduler"""
+    # Network scan job
     scheduler.add_job(
         scheduled_scan,
         'interval',
@@ -343,8 +576,40 @@ def start_scheduler():
         id='network_scan',
         replace_existing=True
     )
+
+    # RF Stats jobs (if enabled)
+    if config.RF_STATS_ENABLED:
+        # Ping round every PING_INTERVAL seconds
+        scheduler.add_job(
+            run_ping_round_task,
+            'interval',
+            seconds=config.PING_INTERVAL,
+            id='rf_ping_scan',
+            replace_existing=True
+        )
+
+        # Iperf queue processing every IPERF_INTERVAL seconds
+        scheduler.add_job(
+            process_iperf_queue_task,
+            'interval',
+            seconds=config.IPERF_INTERVAL,
+            id='rf_iperf_processor',
+            replace_existing=True
+        )
+
+        # History cleanup every hour
+        scheduler.add_job(
+            cleanup_history_task,
+            'interval',
+            hours=1,
+            id='rf_history_cleanup',
+            replace_existing=True
+        )
+
+        logger.info(f"RF Stats enabled: ping every {config.PING_INTERVAL}s, iperf every {config.IPERF_INTERVAL}s")
+
     scheduler.start()
-    logger.info(f"Scheduler started with {config.POLL_INTERVAL}s interval")
+    logger.info(f"Scheduler started with {config.POLL_INTERVAL}s scan interval")
 
 
 # Ensure scheduler shuts down on exit

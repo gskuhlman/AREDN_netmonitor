@@ -12,6 +12,9 @@ let selectedNode = null;
 let knownNodes = new Set();  // Track known nodes for drop detection
 let isInitialLoad = true;    // Track if this is the first load (for physics)
 let droppedNodes = new Map(); // Track dropped nodes with timestamp: {nodeId: {timestamp, nodeData}}
+let isPinging = false;       // Track if continuous ping is active
+let pingTargetNode = null;   // Track which node is being pinged
+let pingIntervalId = null;   // Interval ID for REST API ping
 
 // How long to keep dropped nodes visible (15 minutes in milliseconds)
 const DROPPED_NODE_VISIBILITY_MS = 15 * 60 * 1000;
@@ -85,6 +88,11 @@ const NODE_COLORS = {
         background: '#CCCCCC',
         border: '#e74c3c',
         highlight: { background: '#DDDDDD', border: '#e74c3c' }
+    },
+    inactive: {
+        background: '#E0E0E0',
+        border: '#999999',
+        highlight: { background: '#EEEEEE', border: '#999999' }
     }
 };
 
@@ -225,6 +233,11 @@ function handleNodeBlur(params) {
  * Show node details in side panel
  */
 async function showNodeDetails(nodeId) {
+    // Stop any active ping if switching to a different node
+    if (isPinging && pingTargetNode !== nodeId) {
+        stopNodePing();
+    }
+
     selectedNode = nodeId;
     panelTitle.textContent = nodeId;
 
@@ -251,6 +264,9 @@ function renderNodeDetails(data) {
     const services = data.services || [];
     const links = data.links || [];
 
+    // Determine if this is the currently pinging node
+    const isCurrentlyPinging = isPinging && pingTargetNode === node.name;
+
     let html = `
         <div class="node-info">
             <h3>Node Information</h3>
@@ -263,6 +279,13 @@ function renderNodeDetails(data) {
                 <tr><td>First Seen:</td><td>${formatDate(node.first_seen)}</td></tr>
                 <tr><td>Last Seen:</td><td>${formatDate(node.last_seen)}</td></tr>
             </table>
+            <div class="node-ping-section">
+                <button id="ping-btn" class="btn ${isCurrentlyPinging ? 'btn-danger' : 'btn-primary'}"
+                        onclick="toggleNodePing('${node.name}')" ${!node.ip ? 'disabled' : ''}>
+                    ${isCurrentlyPinging ? 'Stop Ping' : 'Ping'}
+                </button>
+                <div id="ping-output" class="ping-output ${isCurrentlyPinging ? '' : 'hidden'}"></div>
+            </div>
         </div>
     `;
 
@@ -299,18 +322,30 @@ function renderNodeDetails(data) {
         html += '</table></div>';
     }
 
-    if (services.length > 0) {
+    // Add iPerf3 as a built-in service for all AREDN nodes
+    const allServices = [...services];
+    if (node.ip) {
+        allServices.push({
+            name: 'iPerf3 (built-in)',
+            link: null,
+            builtin: true
+        });
+    }
+
+    if (allServices.length > 0) {
         html += `
             <div class="node-services">
-                <h3>Services (${services.length})</h3>
+                <h3>Services (${allServices.length})</h3>
                 <ul class="services-list">
         `;
 
-        for (const service of services) {
+        for (const service of allServices) {
             const icon = getServiceIcon(service.name);
             const iconHtml = icon ? `<span class="service-icon">${icon}</span> ` : '';
             if (service.link) {
                 html += `<li>${iconHtml}<a href="${service.link}" target="_blank">${service.name}</a></li>`;
+            } else if (service.builtin && service.name.includes('iPerf')) {
+                html += `<li class="builtin-service">${iconHtml}${service.name}</li>`;
             } else {
                 html += `<li>${iconHtml}${service.name}</li>`;
             }
@@ -369,6 +404,11 @@ function getServiceIcon(serviceName) {
         return '&#9993;';  // Envelope icon
     }
 
+    // iPerf3 service (built into AREDN nodes)
+    if (name.includes('iperf')) {
+        return '&#128200;';  // Chart icon (speed test)
+    }
+
     return null;  // No icon
 }
 
@@ -421,8 +461,143 @@ function showToast(type, title, message, duration = 10000) {
  * Hide the side panel
  */
 function hidePanel() {
+    // Stop any active ping when closing panel
+    if (isPinging) {
+        stopNodePing();
+    }
     sidePanel.classList.add('hidden');
     selectedNode = null;
+}
+
+/**
+ * Toggle continuous ping to a node
+ */
+function toggleNodePing(nodeName) {
+    if (isPinging && pingTargetNode === nodeName) {
+        stopNodePing();
+    } else {
+        startNodePing(nodeName);
+    }
+}
+
+/**
+ * Start continuous ping to a node using REST API
+ */
+function startNodePing(nodeName) {
+    // Stop any existing ping first
+    if (pingIntervalId) {
+        clearInterval(pingIntervalId);
+        pingIntervalId = null;
+    }
+
+    isPinging = true;
+    pingTargetNode = nodeName;
+
+    // Update button state
+    const pingBtn = document.getElementById('ping-btn');
+    if (pingBtn) {
+        pingBtn.textContent = 'Stop Ping';
+        pingBtn.classList.remove('btn-primary');
+        pingBtn.classList.add('btn-danger');
+    }
+
+    // Show and clear output area
+    const pingOutput = document.getElementById('ping-output');
+    if (pingOutput) {
+        pingOutput.classList.remove('hidden');
+        pingOutput.innerHTML = '<div class="ping-line ping-info">Starting ping...</div>';
+    }
+
+    // Function to perform a single ping via REST API
+    const doPing = async () => {
+        if (!isPinging || pingTargetNode !== nodeName) {
+            return;
+        }
+
+        try {
+            const response = await fetch(`/api/ping/${encodeURIComponent(nodeName)}`, {
+                method: 'POST'
+            });
+            const data = await response.json();
+
+            if (!isPinging || pingTargetNode !== nodeName) {
+                return; // Stopped while waiting for response
+            }
+
+            handlePingResult(data);
+        } catch (error) {
+            console.error('Ping error:', error);
+            handlePingResult({
+                success: false,
+                ip: nodeName,
+                error: error.message
+            });
+        }
+    };
+
+    // Start immediate ping, then repeat every 1 second
+    doPing();
+    pingIntervalId = setInterval(doPing, 1000);
+}
+
+/**
+ * Stop continuous ping
+ */
+function stopNodePing() {
+    // Clear the ping interval
+    if (pingIntervalId) {
+        clearInterval(pingIntervalId);
+        pingIntervalId = null;
+    }
+
+    isPinging = false;
+    pingTargetNode = null;
+
+    // Update button state
+    const pingBtn = document.getElementById('ping-btn');
+    if (pingBtn) {
+        pingBtn.textContent = 'Ping';
+        pingBtn.classList.remove('btn-danger');
+        pingBtn.classList.add('btn-primary');
+    }
+
+    // Add stopped message to output
+    const pingOutput = document.getElementById('ping-output');
+    if (pingOutput) {
+        const stopLine = document.createElement('div');
+        stopLine.className = 'ping-line ping-info';
+        stopLine.textContent = '--- Ping stopped ---';
+        pingOutput.appendChild(stopLine);
+    }
+}
+
+/**
+ * Handle ping result from server
+ */
+function handlePingResult(data) {
+    const pingOutput = document.getElementById('ping-output');
+    if (!pingOutput) return;
+
+    const line = document.createElement('div');
+    line.className = 'ping-line';
+
+    if (data.success) {
+        line.classList.add('ping-success');
+        line.textContent = `Reply from ${data.ip}: time=${data.time}ms`;
+    } else {
+        line.classList.add('ping-fail');
+        line.textContent = `Request timed out (${data.ip})`;
+    }
+
+    pingOutput.appendChild(line);
+
+    // Keep only last 50 lines
+    while (pingOutput.children.length > 50) {
+        pingOutput.removeChild(pingOutput.firstChild);
+    }
+
+    // Auto-scroll to bottom
+    pingOutput.scrollTop = pingOutput.scrollHeight;
 }
 
 /**
@@ -513,7 +688,12 @@ function updateNetwork(data) {
 
     // Add or update nodes with appropriate coloring
     for (const node of data.nodes) {
-        if (node.is_supernode) {
+        if (node.is_inactive) {
+            // Inactive node (not polled recently but has links)
+            node.color = NODE_COLORS.inactive;
+            node.label = node.label + '\n(inactive)';
+            node.opacity = 0.7;
+        } else if (node.is_supernode) {
             node.color = NODE_COLORS.supernode;
             node.size = 35;  // Make supernodes larger
         } else if (node.firmware_mismatch) {
@@ -660,6 +840,12 @@ function initSocket() {
         document.getElementById('scan-btn').disabled = true;
         // Show scanning in countdown
         document.getElementById('footer-countdown').textContent = 'Scanning...';
+        // Update scan status in footer
+        const scanStatus = document.getElementById('footer-scan-status');
+        if (scanStatus) {
+            scanStatus.textContent = 'Scanning network...';
+            scanStatus.className = 'scan-status scanning';
+        }
         if (countdownInterval) {
             clearInterval(countdownInterval);
             countdownInterval = null;
@@ -670,6 +856,15 @@ function initSocket() {
         console.log('Scan complete:', data);
         setStatus(true, 'Connected');
         document.getElementById('scan-btn').disabled = false;
+
+        // Update scan status in footer
+        const scanStatus = document.getElementById('footer-scan-status');
+        if (scanStatus && data.result) {
+            const nodes = data.result.nodes_found || 0;
+            const links = data.result.links_found || 0;
+            scanStatus.textContent = `Scan complete: ${nodes} nodes, ${links} links`;
+            scanStatus.className = 'scan-status idle';
+        }
 
         if (data.network) {
             updateNetwork(data.network);
@@ -711,6 +906,15 @@ function initSocket() {
         console.log('New event:', data);
         addEventToLog(data);
     });
+
+    // Setup RF Stats socket handlers if available
+    if (typeof setupRFStatsSocketHandlers === 'function') {
+        setupRFStatsSocketHandlers(socket);
+    }
+
+    // Note: Ping now uses REST API with setInterval instead of WebSocket
+    // The ping_result, ping_started, ping_stopped, and ping_error handlers
+    // have been removed as they are no longer needed.
 }
 
 /**

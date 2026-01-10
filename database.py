@@ -121,11 +121,32 @@ def init_db():
             )
         ''')
 
+        # Link history table for RF statistics over time
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS link_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                source_node TEXT NOT NULL,
+                target_node TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                quality INTEGER,
+                snr INTEGER,
+                ping_min REAL,
+                ping_avg REAL,
+                ping_max REAL,
+                ping_loss REAL,
+                throughput_tx REAL,
+                throughput_rx REAL
+            )
+        ''')
+
         # Create indexes for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_node)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_node)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_services_node ON services(node_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_link_history_link ON link_history(source_node, target_node, timestamp DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_link_history_timestamp ON link_history(timestamp DESC)')
 
 
 # ============ Node Operations ============
@@ -216,6 +237,40 @@ def mark_stale_nodes_inactive(timeout_seconds):
         return cursor.rowcount
 
 
+def get_orphan_nodes():
+    """Get active nodes that have no active links (status != 'removed')"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Find active nodes that don't appear in any non-removed link
+        cursor.execute('''
+            SELECT n.name, n.ip FROM nodes n
+            WHERE n.is_active = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM links l
+                WHERE (l.source_node = n.name OR l.target_node = n.name)
+                AND l.status != 'removed'
+            )
+        ''')
+        return [{'name': row['name'], 'ip': row['ip']} for row in cursor.fetchall()]
+
+
+def mark_orphan_nodes_inactive():
+    """Mark active nodes with no active links as inactive"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE nodes
+            SET is_active = 0
+            WHERE is_active = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM links l
+                WHERE (l.source_node = nodes.name OR l.target_node = nodes.name)
+                AND l.status != 'removed'
+            )
+        ''')
+        return cursor.rowcount
+
+
 # ============ Link Operations ============
 
 def upsert_link(source_node, target_node, link_type, quality=0, snr=None, distance=None):
@@ -231,8 +286,8 @@ def upsert_link(source_node, target_node, link_type, quality=0, snr=None, distan
         ''', (source_node, target_node))
         existing = cursor.fetchone()
 
-        if existing and existing['status'] == 'dropped':
-            # Link was dropped, now back - increment drop_count, reset stable_since
+        if existing and existing['status'] in ('dropped', 'removed'):
+            # Link was dropped/removed, now back - increment drop_count, reset stable_since
             cursor.execute('''
                 UPDATE links SET
                     link_type = ?,
@@ -293,12 +348,13 @@ def get_active_links():
 
 
 def get_node_links(node_name):
-    """Get all links for a specific node (as source or target)"""
+    """Get active links for a specific node (as source or target), excluding removed links"""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM links
-            WHERE source_node = ? OR target_node = ?
+            WHERE (source_node = ? OR target_node = ?)
+            AND status != 'removed'
         ''', (node_name, node_name))
         return [dict(row) for row in cursor.fetchall()]
 
@@ -485,6 +541,195 @@ def clear_old_events(days=30):
         return cursor.rowcount
 
 
+# ============ Link History Operations (RF Stats) ============
+
+def insert_link_history(source_node, target_node, link_type, quality=None, snr=None,
+                        ping_min=None, ping_avg=None, ping_max=None, ping_loss=None,
+                        throughput_tx=None, throughput_rx=None):
+    """Insert a new link history record"""
+    now = local_timestamp()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO link_history (timestamp, source_node, target_node, link_type,
+                                     quality, snr, ping_min, ping_avg, ping_max, ping_loss,
+                                     throughput_tx, throughput_rx)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (now, source_node, target_node, link_type, quality, snr,
+              ping_min, ping_avg, ping_max, ping_loss, throughput_tx, throughput_rx))
+        return cursor.lastrowid
+
+
+def get_link_history(source_node, target_node, hours=24, limit=2000):
+    """Get history for a specific link within the time range"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM link_history
+            WHERE source_node = ? AND target_node = ?
+            AND timestamp > ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+        ''', (source_node, target_node, cutoff, limit))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_all_rf_links_history(hours=24):
+    """Get recent history for all RF links"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM link_history
+            WHERE link_type = 'RF'
+            AND timestamp > ?
+            ORDER BY source_node, target_node, timestamp ASC
+        ''', (cutoff,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_rf_links():
+    """Get all active RF-type links"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE link_type = 'RF'
+            AND status != 'removed'
+            ORDER BY source_node, target_node
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_rf_links_with_latest_stats():
+    """Get RF links with their most recent history stats"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Get RF links with latest history entry
+        cursor.execute('''
+            SELECT l.*, h.ping_avg, h.ping_loss, h.throughput_tx, h.throughput_rx,
+                   h.timestamp as last_test_time
+            FROM links l
+            LEFT JOIN (
+                SELECT source_node, target_node, ping_avg, ping_loss,
+                       throughput_tx, throughput_rx, timestamp,
+                       ROW_NUMBER() OVER (PARTITION BY source_node, target_node
+                                         ORDER BY timestamp DESC) as rn
+                FROM link_history
+            ) h ON l.source_node = h.source_node
+                AND l.target_node = h.target_node
+                AND h.rn = 1
+            WHERE l.link_type = 'RF'
+            AND l.status != 'removed'
+            ORDER BY l.source_node, l.target_node
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_latest_link_stats(source_node, target_node):
+    """Get the most recent stats for a specific link"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM link_history
+            WHERE source_node = ? AND target_node = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ''', (source_node, target_node))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def cleanup_link_history(hours=24):
+    """Remove link history records older than specified hours"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM link_history WHERE timestamp < ?', (cutoff,))
+        return cursor.rowcount
+
+
+def update_link_history_ping(source_node, target_node, ping_min, ping_avg, ping_max, ping_loss):
+    """Update the most recent history record with ping data, or insert new if none recent"""
+    now = local_timestamp()
+    # Check if there's a recent record (within last 2 minutes) to update
+    cutoff = (datetime.now() - timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id FROM link_history
+            WHERE source_node = ? AND target_node = ?
+            AND timestamp > ?
+            AND ping_avg IS NULL
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ''', (source_node, target_node, cutoff))
+        row = cursor.fetchone()
+
+        if row:
+            # Update existing record
+            cursor.execute('''
+                UPDATE link_history
+                SET ping_min = ?, ping_avg = ?, ping_max = ?, ping_loss = ?
+                WHERE id = ?
+            ''', (ping_min, ping_avg, ping_max, ping_loss, row['id']))
+        else:
+            # Get link info for new record
+            cursor.execute('''
+                SELECT link_type, quality, snr FROM links
+                WHERE source_node = ? AND target_node = ?
+            ''', (source_node, target_node))
+            link = cursor.fetchone()
+            if link:
+                cursor.execute('''
+                    INSERT INTO link_history (timestamp, source_node, target_node, link_type,
+                                             quality, snr, ping_min, ping_avg, ping_max, ping_loss)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (now, source_node, target_node, link['link_type'],
+                      link['quality'], link['snr'], ping_min, ping_avg, ping_max, ping_loss))
+
+
+def update_link_history_throughput(source_node, target_node, throughput_tx, throughput_rx):
+    """Update the most recent history record with throughput data, or insert new if none recent"""
+    now = local_timestamp()
+    # Check if there's a recent record (within last 2 minutes) to update
+    cutoff = (datetime.now() - timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id FROM link_history
+            WHERE source_node = ? AND target_node = ?
+            AND timestamp > ?
+            AND throughput_tx IS NULL
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ''', (source_node, target_node, cutoff))
+        row = cursor.fetchone()
+
+        if row:
+            # Update existing record
+            cursor.execute('''
+                UPDATE link_history
+                SET throughput_tx = ?, throughput_rx = ?
+                WHERE id = ?
+            ''', (throughput_tx, throughput_rx, row['id']))
+        else:
+            # Get link info for new record
+            cursor.execute('''
+                SELECT link_type, quality, snr FROM links
+                WHERE source_node = ? AND target_node = ?
+            ''', (source_node, target_node))
+            link = cursor.fetchone()
+            if link:
+                cursor.execute('''
+                    INSERT INTO link_history (timestamp, source_node, target_node, link_type,
+                                             quality, snr, throughput_tx, throughput_rx)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (now, source_node, target_node, link['link_type'],
+                      link['quality'], link['snr'], throughput_tx, throughput_rx))
+
+
 # ============ Utility Functions ============
 
 def get_link_color(link):
@@ -547,8 +792,43 @@ def get_service_icon(service_name):
 
 def get_network_graph_data():
     """Get data formatted for vis.js network graph"""
-    nodes = get_active_nodes()
+    active_nodes = get_active_nodes()
+    all_nodes = get_all_nodes()
     links = get_active_links()
+
+    # Create sets for quick lookup
+    active_node_names = {n['name'] for n in active_nodes}
+    supernode_names = {n['name'] for n in active_nodes if n.get('is_supernode')}
+    active_non_supernode_names = active_node_names - supernode_names
+
+    # Find inactive nodes that are DIRECTLY connected to active NON-SUPERNODE nodes
+    # (don't show nodes that are only connected to supernodes - they're "beyond" the supernode)
+    inactive_nodes_to_show = set()
+    for link in links:
+        source = link['source_node']
+        target = link['target_node']
+        # If one end is an active non-supernode and the other is not active, show the inactive one
+        if source in active_non_supernode_names and target not in active_node_names:
+            inactive_nodes_to_show.add(target)
+        elif target in active_non_supernode_names and source not in active_node_names:
+            inactive_nodes_to_show.add(source)
+
+    # Include active nodes + inactive nodes directly connected to active nodes
+    nodes = []
+    nodes_to_show = set()
+    for node in all_nodes:
+        if node['name'] in active_node_names:
+            node['is_inactive'] = False
+            nodes.append(node)
+            nodes_to_show.add(node['name'])
+        elif node['name'] in inactive_nodes_to_show:
+            # Inactive node but directly connected to an active node
+            node['is_inactive'] = True
+            nodes.append(node)
+            nodes_to_show.add(node['name'])
+
+    # Filter links to only include those where BOTH ends are in nodes_to_show
+    links = [link for link in links if link['source_node'] in nodes_to_show and link['target_node'] in nodes_to_show]
 
     # Get reference firmware version
     reference_firmware = get_starting_node_firmware()
@@ -595,6 +875,7 @@ def get_network_graph_data():
             'firmware_mismatch': firmware_mismatch,
             'rf_frequency': rf_freq,
             'is_supernode': supernode,
+            'is_inactive': node.get('is_inactive', False),
             'node_type': 'main'
         })
 
