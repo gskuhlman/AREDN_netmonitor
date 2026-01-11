@@ -230,24 +230,31 @@
 
     <!-- Legend -->
     <div class="legend">
-        <h4>Link Quality</h4>
+        <h4>Link Quality (Color)</h4>
         <div class="legend-item">
-            <span class="legend-color green"></span> Good (>70%, stable)
+            <span class="legend-color green"></span> Good (>85%)
         </div>
         <div class="legend-item">
-            <span class="legend-color yellow"></span> Poor (40-70%)
+            <span class="legend-color yellow"></span> Poor (50-85%)
         </div>
         <div class="legend-item">
-            <span class="legend-color red"></span> Bad/Dropped
+            <span class="legend-color red"></span> Bad/Dropped (<50%)
         </div>
         <div class="legend-item">
-            <span class="legend-line dtd"></span> DTD Link (paired)
+            <span class="legend-color blue"></span> DTD (always blue)
         </div>
+        <h4>Link Type (Pattern)</h4>
         <div class="legend-item">
             <span class="legend-line rf"></span> RF Link
         </div>
         <div class="legend-item">
-            <span class="legend-line tunnel"></span> Tunnel Link
+            <span class="legend-line dtd"></span> DTD (thick)
+        </div>
+        <div class="legend-item">
+            <span class="legend-line tunnel"></span> Tunnel (legacy)
+        </div>
+        <div class="legend-item">
+            <span class="legend-line wireguard"></span> Wireguard
         </div>
         <div class="legend-item">
             <span class="legend-line xlink"></span> Xlink

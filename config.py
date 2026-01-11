@@ -13,8 +13,8 @@ LINK_TIMEOUT = 300  # 5 minutes - mark link as dropped
 LINK_REMOVE_AFTER = 600  # 10 minutes - remove from display
 
 # Link quality thresholds (0-100)
-QUALITY_GOOD = 70  # Above this = green
-QUALITY_POOR = 40  # Above this = yellow, below = red
+QUALITY_GOOD = 85  # Above this = green
+QUALITY_POOR = 50  # Above this = yellow, below = red
 
 # Connection types to show (filter out tunnels)
 SHOW_TUNNELS = False
@@ -31,7 +31,7 @@ REQUEST_TIMEOUT = 10
 # Web server settings
 HOST = "0.0.0.0"
 PORT = 5000
-DEBUG = True
+DEBUG = False  # Disabled - eventlet doesn't work well with werkzeug's reloader
 
 # ============ RF Statistics Configuration ============
 

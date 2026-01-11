@@ -185,16 +185,29 @@ function initNetwork() {
         }
     });
 
-    // Save node position after drag
+    // Temporarily unfix node when dragging starts so it can be moved
+    network.on('dragStart', function(params) {
+        if (params.nodes.length > 0) {
+            const nodeId = params.nodes[0];
+            nodesDataset.update({
+                id: nodeId,
+                fixed: { x: false, y: false }
+            });
+        }
+    });
+
+    // Save node position after drag and fix it in place
     network.on('dragEnd', function(params) {
         if (params.nodes.length > 0) {
             const nodeId = params.nodes[0];
             const positions = network.getPositions([nodeId]);
 
+            // Update node with position AND fixed property to prevent movement
             nodesDataset.update({
                 id: nodeId,
                 x: positions[nodeId].x,
-                y: positions[nodeId].y
+                y: positions[nodeId].y,
+                fixed: { x: true, y: true }
             });
 
             // Save to localStorage
@@ -703,11 +716,15 @@ function updateNetwork(data) {
         }
 
         if (currentNodeIds.includes(node.id)) {
-            // Preserve existing position if node was manually positioned
+            // Preserve existing position and fixed state if node was manually positioned
             const existingNode = nodesDataset.get(node.id);
             if (existingNode && existingNode.x !== undefined) {
                 node.x = existingNode.x;
                 node.y = existingNode.y;
+                // Preserve fixed property if it was set
+                if (existingNode.fixed) {
+                    node.fixed = existingNode.fixed;
+                }
             }
             nodesDataset.update(node);
         } else {
@@ -715,6 +732,8 @@ function updateNetwork(data) {
             if (savedPositions[node.id]) {
                 node.x = savedPositions[node.id].x;
                 node.y = savedPositions[node.id].y;
+                // Fix position since it was manually saved
+                node.fixed = { x: true, y: true };
             }
             nodesDataset.add(node);
         }
@@ -885,6 +904,13 @@ function initSocket() {
         setStatus(true, 'Scan failed');
         document.getElementById('scan-btn').disabled = false;
         showToast('error', 'Scan Failed', data.error || 'An error occurred during the network scan');
+    });
+
+    // Handle starting node unreachable error
+    socket.on('starting_node_error', (data) => {
+        console.error('Starting node error:', data);
+        showToast('error', 'Starting Node Unreachable',
+            data.error || 'Cannot connect to the starting node. Check your network connection and settings.');
     });
 
     // Handle link drop notifications

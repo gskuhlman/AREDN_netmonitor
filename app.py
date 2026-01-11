@@ -3,9 +3,15 @@ AREDN Network Monitor - Flask Application
 Main entry point for the web application
 """
 
+# Monkey-patch standard library for eventlet compatibility
+# MUST be done before any other imports that use threading
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 import logging
 import atexit
 import os
@@ -30,15 +36,28 @@ app.config['SECRET_KEY'] = 'aredn-monitor-secret-key'
 # Initialize SocketIO
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# Initialize scheduler
-scheduler = BackgroundScheduler()
+# Initialize scheduler with eventlet-compatible executor
+# Use a small thread pool since eventlet monkey-patches threading
+executors = {
+    'default': ThreadPoolExecutor(max_workers=3)
+}
+job_defaults = {
+    'coalesce': True,  # Combine multiple pending executions into one
+    'max_instances': 1,  # Only one instance of each job at a time
+    'misfire_grace_time': 60  # Allow 60 seconds grace period for misfires
+}
+scheduler = BackgroundScheduler(executors=executors, job_defaults=job_defaults)
 
 # Track scan state
 scan_state = {
     'is_scanning': False,
     'last_scan': None,
-    'last_result': None
+    'last_result': None,
+    'last_scan_finished': None  # Timestamp when last scan completed
 }
+
+# Minimum gap between scans (seconds)
+MIN_SCAN_GAP = 10
 
 # Track active ping sessions per client (sid -> {node_name, session_id})
 active_ping_sessions = {}
@@ -53,6 +72,14 @@ def scheduled_scan():
         logger.warning("Scan already in progress, skipping")
         return
 
+    # Ensure minimum gap between scans
+    if scan_state['last_scan_finished']:
+        elapsed = (datetime.now() - scan_state['last_scan_finished']).total_seconds()
+        if elapsed < MIN_SCAN_GAP:
+            wait_time = MIN_SCAN_GAP - elapsed
+            logger.info(f"Waiting {wait_time:.1f}s before starting scan (minimum gap: {MIN_SCAN_GAP}s)")
+            socketio.sleep(wait_time)
+
     scan_state['is_scanning'] = True
 
     # Notify clients that scan is starting
@@ -62,6 +89,14 @@ def scheduled_scan():
         result = scanner.run_scan()
         scan_state['last_scan'] = result['timestamp']
         scan_state['last_result'] = result
+
+        # Check if starting node was unreachable
+        if result.get('starting_node_error'):
+            socketio.emit('starting_node_error', {
+                'error': result['starting_node_error'],
+                'timestamp': datetime.now().isoformat()
+            })
+            logger.error(f"Starting node error: {result['starting_node_error']}")
 
         # Record RF link stats (quality/SNR) to history
         if config.RF_STATS_ENABLED:
@@ -101,6 +136,7 @@ def scheduled_scan():
 
     finally:
         scan_state['is_scanning'] = False
+        scan_state['last_scan_finished'] = datetime.now()
 
 
 # ============ Web Routes ============
@@ -612,8 +648,17 @@ def start_scheduler():
     logger.info(f"Scheduler started with {config.POLL_INTERVAL}s scan interval")
 
 
-# Ensure scheduler shuts down on exit
-atexit.register(lambda: scheduler.shutdown(wait=False))
+# Ensure scheduler shuts down cleanly on exit
+def shutdown_scheduler():
+    """Safely shutdown the scheduler"""
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler shut down cleanly")
+    except Exception as e:
+        logger.warning(f"Error shutting down scheduler: {e}")
+
+atexit.register(shutdown_scheduler)
 
 
 if __name__ == '__main__':
@@ -629,9 +674,16 @@ if __name__ == '__main__':
         # Start scheduler
         start_scheduler()
 
-        # Run initial scan
-        logger.info("Running initial scan...")
-        socketio.start_background_task(scheduled_scan)
+        # Schedule initial scan to run after server starts (5 second delay)
+        # This ensures the server is listening before we start scanning
+        from datetime import timedelta
+        scheduler.add_job(
+            scheduled_scan,
+            'date',
+            run_date=datetime.now() + timedelta(seconds=5),
+            id='initial_scan'
+        )
+        logger.info("Initial scan scheduled to run in 5 seconds...")
 
     # Start server
     logger.info(f"Starting server on {config.HOST}:{config.PORT}")

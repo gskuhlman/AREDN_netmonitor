@@ -85,10 +85,23 @@ Key settings in `config.py`:
 
 Settings can be overridden at runtime via `/api/settings` and persist to database.
 
-## Link Quality Visualization
+## Link Visualization
 
-- Green: >70% quality (good)
-- Yellow: 40-70% quality (poor)
-- Red: <40% quality (bad)
-- Link types: RF (standard), DTD (thick blue), Xlink (purple), Tunnel (dashed gray)
-- Node colors: Blue (normal), Orange (firmware mismatch), Purple (supernode), Gray (dropped)
+### Link Quality (Color)
+- Green: >85% quality (good)
+- Yellow: 50-85% quality (poor)
+- Red: <50% quality (bad/dropped)
+- Blue: DTD links (always blue, wired connections)
+
+### Link Type (Line Pattern)
+- RF: Solid line, normal width
+- DTD: Thick solid blue line (wired connection)
+- Tunnel (legacy): Dashed line
+- Wireguard: Dotted line
+- Xlink: Dash-dot pattern
+
+### Node Colors
+- Blue: Normal node
+- Orange: Firmware mismatch
+- Purple: Supernode
+- Gray: Dropped/offline

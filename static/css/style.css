@@ -474,36 +474,51 @@ body {
     background-color: #e74c3c;
 }
 
-.legend-line {
-    width: 20px;
-    height: 0;
-    border-top-style: solid;
-    border-color: #666;
+.legend-color.blue {
+    background-color: #3498db;
 }
 
-.legend-line.dtd {
-    border-top-width: 5px;
-    border-color: #3498db;
-    width: 15px;
+/* Link Type Legend - patterns indicate type (color indicates quality in actual graph) */
+.legend-line {
+    width: 30px;
+    height: 0;
+    border-top-style: solid;
+    border-top-width: 2px;
+    border-color: #555;
+    display: inline-block;
+    vertical-align: middle;
 }
 
 .legend-line.rf {
+    /* RF: solid line, normal width */
     border-top-width: 2px;
-    border-color: #27ae60;
-    width: 25px;
+    border-top-style: solid;
+}
+
+.legend-line.dtd {
+    /* DTD: thick solid blue line */
+    border-top-width: 5px;
+    border-top-style: solid;
+    border-color: #3498db;
+    width: 20px;
 }
 
 .legend-line.tunnel {
-    border-top-width: 1px;
-    border-style: dashed;
-    border-color: #999;
-    width: 25px;
+    /* Old tunnel: dashed line */
+    border-top-width: 2px;
+    border-top-style: dashed;
+}
+
+.legend-line.wireguard {
+    /* Wireguard: dotted line */
+    border-top-width: 2px;
+    border-top-style: dotted;
 }
 
 .legend-line.xlink {
-    border-top-width: 2px;
-    border-color: #9b59b6;
-    width: 25px;
+    /* Xlink: thicker dashed line to distinguish from tunnel */
+    border-top-width: 3px;
+    border-top-style: dashed;
 }
 
 .legend-node {

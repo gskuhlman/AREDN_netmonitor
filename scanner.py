@@ -298,6 +298,7 @@ def discover_network(start_url=None, max_depth=None):
     errors = []
     max_depth_reached = 0
     all_events = []
+    starting_node_error = None  # Track if starting node failed
 
     while queue:
         url, depth = queue.pop(0)
@@ -313,7 +314,12 @@ def discover_network(start_url=None, max_depth=None):
         # Fetch node data
         data = fetch_node_info(url)
         if not data:
-            errors.append(f"Failed to fetch: {url}")
+            error_msg = f"Failed to fetch: {url}"
+            errors.append(error_msg)
+            # Check if this is the starting node (depth 0 and first failure)
+            if depth == 0 and starting_node_error is None:
+                starting_node_error = f"Starting node unreachable: {url}"
+                logger.error(starting_node_error)
             continue
 
         # Process the node
@@ -357,7 +363,8 @@ def discover_network(start_url=None, max_depth=None):
         'max_depth_reached': max_depth_reached,
         'errors': errors,
         'events': all_events,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'starting_node_error': starting_node_error  # None if starting node was reachable
     }
 
 

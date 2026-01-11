@@ -733,18 +733,38 @@ def update_link_history_throughput(source_node, target_node, throughput_tx, thro
 # ============ Utility Functions ============
 
 def get_link_color(link):
-    """Determine link color based on quality and status"""
-    if link['status'] == 'dropped':
+    """Determine link color based on quality, status, and link type"""
+    link_type = link.get('link_type', '').upper()
+
+    # DTD links are always blue (wired connections)
+    if link_type == 'DTD':
+        return 'blue'
+
+    # Dropped links are always red
+    if link.get('status') == 'dropped':
         return 'red'
 
     quality = link.get('quality', 0)
-    drop_count = link.get('drop_count', 0)
 
-    if quality > config.QUALITY_GOOD and drop_count == 0:
+    # Tunnels and Xlinks don't have traditional quality metrics
+    # If they're active (not dropped), treat them as good quality
+    if link_type in ('TUN', 'TUNNEL', 'VTUN', 'WIREGUARD', 'WG', 'XLINK'):
+        if quality == 0 or quality >= 100:
+            return 'green'
+        # Some tunnels may report actual quality - use it
+        if quality > config.QUALITY_GOOD:
+            return 'green'
+        elif quality > config.QUALITY_POOR:
+            return 'yellow'
+        else:
+            return 'red'
+
+    # RF links - color based purely on quality percentage
+    if quality > config.QUALITY_GOOD:  # >85%
         return 'green'
-    elif quality > config.QUALITY_POOR:
+    elif quality > config.QUALITY_POOR:  # >50%
         return 'yellow'
-    else:
+    else:  # <=50%
         return 'red'
 
 
@@ -881,64 +901,70 @@ def get_network_graph_data():
 
     # Build edge data for vis.js
     vis_edges = []
-    seen_pairs = set()
-    dtd_pairs = []  # Track DTD-connected node pairs
 
-    # Color map for link quality - RF and tunnel links
-    color_map = {
-        'green': '#27ae60',
-        'yellow': '#f39c12',
-        'red': '#e74c3c'
+    # COLOR = Quality (or fixed color for certain link types)
+    quality_color_map = {
+        'green': '#27ae60',   # Good quality (>85%)
+        'yellow': '#f39c12',  # Poor quality (50-85%)
+        'red': '#e74c3c',     # Bad quality (<50%) or dropped
+        'blue': '#3498db',    # DTD links (always blue)
+        'gray': '#7f8c8d'     # Unknown/no data
     }
 
-    # Color map for DTD links - blue for good, red for bad
-    dtd_color_map = {
-        'green': '#3498db',  # Blue
-        'yellow': '#3498db', # Blue (treat poor as good for DTD)
-        'red': '#e74c3c'     # Red
-    }
-
-    # Color map for Xlink - purple for good, red for bad
-    xlink_color_map = {
-        'green': '#9b59b6',  # Purple
-        'yellow': '#9b59b6', # Purple (treat poor as good for Xlink)
-        'red': '#e74c3c'     # Red
-    }
-
+    # First pass: collect all links and find best quality for each pair
+    # (links can be asymmetric - A→B may have different quality than B→A)
+    link_pairs = {}
     for link in links:
-        # Create a canonical pair to avoid duplicates
         pair = tuple(sorted([link['source_node'], link['target_node']]))
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-
-        link_type = link['link_type']
-
-        # QUALITY determines COLOR - DTD uses blue, Xlink uses purple, others use green/yellow/red
-        link_color_status = get_link_color(link)
-        if link_type.upper() == 'DTD':
-            quality_color = dtd_color_map.get(link_color_status, '#3498db')
-        elif link_type.upper() == 'XLINK':
-            quality_color = xlink_color_map.get(link_color_status, '#9b59b6')
+        if pair not in link_pairs:
+            link_pairs[pair] = link.copy()
         else:
-            quality_color = color_map.get(link_color_status, '#27ae60')
+            # Use the LOWER quality of bidirectional links (conservative)
+            existing = link_pairs[pair]
+            if link.get('quality', 0) < existing.get('quality', 0):
+                link_pairs[pair]['quality'] = link.get('quality', 0)
+            # Keep the worse SNR too
+            if link.get('snr') and existing.get('snr'):
+                if link['snr'] < existing['snr']:
+                    link_pairs[pair]['snr'] = link['snr']
 
-        # TYPE determines STYLE (line width, dashes, length)
-        # Default: RF link style
+    for pair, link in link_pairs.items():
+        link_type = link['link_type'].upper()
+
+        # COLOR = Quality (same for all link types)
+        link_color_status = get_link_color(link)
+        quality_color = quality_color_map.get(link_color_status, '#27ae60')
+
+        # PATTERN = Link Type
+        # RF: Solid line, normal width
+        # DTD: Thick solid line (direct wired connection)
+        # Tunnel (old): Dashed line [10, 10]
+        # Wireguard: Dotted line [3, 3]
+        # Xlink: Dash-dot pattern [15, 5, 3, 5]
         dashes = False
         width = 2
         length = None  # Use physics default
 
-        if link_type.upper() == 'DTD':
+        if link_type == 'DTD':
             # DTD: thick solid line, very short length (keeps paired nodes close)
+            dashes = False
             width = 5
             length = 20
-            dtd_pairs.append(pair)
-        elif link_type.upper() in ('WIREGUARD', 'TUN', 'TUNNEL', 'VTUN', 'WG'):
-            # All tunnel types: thin dashed line, longer length
-            dashes = True
+        elif link_type == 'XLINK':
+            # Xlink: dash-dot pattern, slightly thicker for visibility
+            dashes = [12, 4, 2, 4]
+            width = 3
+        elif link_type in ('TUN', 'TUNNEL', 'VTUN'):
+            # Old-style tunnel: dashed line, longer length
+            dashes = [10, 10]
             width = 1
             length = 300
+        elif link_type in ('WIREGUARD', 'WG'):
+            # Wireguard: dotted line, longer length
+            dashes = [3, 3]
+            width = 1
+            length = 300
+        # else: RF - solid line (dashes = False, width = 2)
 
         # Build edge object
         edge = {
@@ -947,8 +973,8 @@ def get_network_graph_data():
             'color': {'color': quality_color, 'highlight': quality_color},
             'width': width,
             'dashes': dashes,
-            'title': f"Type: {link_type}\nQuality: {link['quality']}%\nSNR: {link.get('snr', 'N/A')}",
-            'link_type': link_type,
+            'title': f"Type: {link['link_type']}\nQuality: {link['quality']}%\nSNR: {link.get('snr', 'N/A')}",
+            'link_type': link['link_type'],
             'quality': link['quality'],
             'snr': link.get('snr'),
             'status': link['status'],
