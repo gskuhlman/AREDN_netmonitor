@@ -12,14 +12,16 @@ A real-time web application for monitoring and visualizing AREDN (Amateur Radio 
 - **Real-time Updates**: Live updates via WebSocket (Socket.IO) with 30-second polling interval
 - **Interactive Visualization**: Drag-and-drop network graph using vis.js
 - **Link Quality Monitoring**: Color-coded links showing connection quality
-  - Green: Good quality (>70%)
-  - Yellow: Poor quality (40-70%)
-  - Red: Bad/Dropped connection
-- **Link Type Identification**: Visual distinction between link types
-  - RF Links: Green, standard width
-  - DTD Links: Blue, thick (keeps paired nodes close)
-  - Xlink: Purple
-  - Tunnel/Wireguard: Gray, dashed
+  - Green: Good quality (>85%)
+  - Yellow: Poor quality (50-85%)
+  - Red: Bad/Dropped connection (<50%)
+  - Blue: DTD links (always blue, wired connections)
+- **Link Type Identification**: Line patterns distinguish link types
+  - RF Links: Solid line, normal width
+  - DTD Links: Thick solid blue line
+  - Tunnel (legacy): Dashed line
+  - Wireguard: Dotted line
+  - Xlink: Dash-dot pattern
 - **Supernode Detection**: Purple highlighting for supernodes, discovery stops at supernode boundaries
 - **Service Icons**: Shows available services (Phone, MeshChat, PBX, Camera, etc.) on node labels
 - **Firmware Mismatch Detection**: Orange highlighting for nodes with mismatched firmware
@@ -80,29 +82,96 @@ Edit `config.py` to customize:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `STARTING_NODE` | `http://localnode.local.mesh` | Seed node for discovery |
-| `POLL_INTERVAL` | `30` | Seconds between scans |
+| `POLL_INTERVAL` | `60` | Seconds between scans |
 | `MAX_DEPTH` | `5` | Maximum hops from starting node |
 | `LINK_TIMEOUT` | `300` | Seconds before marking link as dropped |
 | `SHOW_TUNNELS` | `False` | Show tunnel/wireguard links |
-| `QUALITY_GOOD` | `70` | Threshold for "good" quality |
-| `QUALITY_POOR` | `40` | Threshold for "poor" quality |
+| `QUALITY_GOOD` | `85` | Threshold for "good" quality (green) |
+| `QUALITY_POOR` | `50` | Threshold for "poor" quality (yellow) |
+
+## Deployment (Ubuntu Server)
+
+### Quick Start
+
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv git iputils-ping iperf3
+
+# Clone and setup
+git clone https://github.com/gskuhlman/AREDN_netmonitor.git
+cd AREDN_netmonitor
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Configure your starting node
+nano config.py
+
+# Run
+python app.py
+```
+
+### Systemd Service (Recommended for Production)
+
+1. Create a dedicated user:
+   ```bash
+   sudo useradd -r -s /bin/bash -m -d /home/aredn aredn
+   ```
+
+2. Setup as the aredn user:
+   ```bash
+   sudo -u aredn -i
+   git clone https://github.com/gskuhlman/AREDN_netmonitor.git
+   cd AREDN_netmonitor
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   nano config.py  # Set your starting node
+   exit
+   ```
+
+3. Install and enable the service:
+   ```bash
+   sudo cp /home/aredn/AREDN_netmonitor/aredn-monitor.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now aredn-monitor
+   ```
+
+4. Manage the service:
+   ```bash
+   sudo systemctl status aredn-monitor   # Check status
+   sudo journalctl -u aredn-monitor -f   # View logs
+   sudo systemctl restart aredn-monitor  # Restart
+   ```
+
+### Using Your Own Username
+
+Edit the service file before installing:
+```bash
+sudo nano /etc/systemd/system/aredn-monitor.service
+# Replace 'aredn' with your username in User=, Group=, WorkingDirectory=, etc.
+```
 
 ## Project Structure
 
 ```
 AREDN_netmonitor/
-├── app.py              # Flask application entry point
-├── config.py           # Configuration settings
-├── database.py         # SQLite database operations
-├── scanner.py          # Network discovery logic
-├── requirements.txt    # Python dependencies
+├── app.py                  # Flask application entry point
+├── config.py               # Configuration settings
+├── database.py             # SQLite database operations
+├── scanner.py              # Network discovery logic
+├── rf_stats.py             # RF statistics (ping/iperf testing)
+├── requirements.txt        # Python dependencies
+├── aredn-monitor.service   # Systemd service file for deployment
 ├── static/
 │   ├── css/
-│   │   └── style.css   # Application styles
+│   │   └── style.css       # Application styles
 │   └── js/
-│       └── network.js  # vis.js network visualization
+│       ├── network.js      # vis.js network visualization
+│       └── rf-stats.js     # RF statistics charts
 └── templates/
-    └── index.html      # Main page template
+    └── index.html          # Main page template
 ```
 
 ## API Endpoints
